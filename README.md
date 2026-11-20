@@ -186,6 +186,50 @@
 
 ---
 
+## Inria canonical Lance runtime adaptation
+
+`inria_runtime_dataset.py` reads the Inria `pretrain_V1` canonical Lance release
+and constructs FBMAE tokens and time-frequency targets inside DataLoader workers.
+It selects only rows with `valid_samples == 1000` and never writes a processed
+Lance dataset.
+
+The COS bucket is S3 compatible. Lance therefore uses an `s3://` URI plus a
+storage-options JSON file; `cos://` is only used by `coscli` and is not a Lance
+URI. A storage-options file has the following structure (keep real credentials
+outside the repository):
+
+```json
+{
+  "aws_access_key_id": "<COS_SECRET_ID>",
+  "aws_secret_access_key": "<COS_SECRET_KEY>",
+  "aws_endpoint": "https://cos.ap-beijing.myqcloud.com",
+  "aws_region": "ap-beijing",
+  "aws_virtual_hosted_style_request": "true"
+}
+```
+
+Tencent Cloud validation entry command:
+
+```bash
+cd /path/to/EEG_pretrain
+
+python scripts/validate_inria_runtime_adapter.py \
+  --lance-uri s3://omni-eeg-processed-1442740494/datasets/inria/releases/pretrain_V1/data.lance \
+  --storage-options-json /path/to/secrets/cos_storage_options.json \
+  --max-samples 128 \
+  --batch-size 8 \
+  --num-workers 4 \
+  --prefetch-factor 2 \
+  --report-every 5
+```
+
+The command validates tensor shapes, finite values, index ranges,
+channel-major ordering, zero-filled invalid channels, nonconstant targets, and
+token/target flatten alignment. It also reports adaptation, target-computation,
+and end-to-end DataLoader timing.
+
+---
+
 ### 总结
 
 整个项目实现了一个完整的 EEG 自监督预训练框架。它可以从原始 EEG 数据中提取时空和频谱特征，通过 Token Masking 和 Band Power Trajectory 预测训练 Transformer 模型。训练得到的模型能作为通用表示用于各种下游 EEG 任务，如脑机接口、情绪识别或疾病诊断。每个模块都有明确职责，形成从原始数据到模型预训练的完整流水线。
