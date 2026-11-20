@@ -42,14 +42,6 @@ SOURCE_COLUMNS: Tuple[str, ...] = (
 )
 
 
-def load_storage_options(path: str) -> Dict[str, str]:
-    with open(path, "r", encoding="utf-8") as f:
-        values = json.load(f)
-    if "storage_options" in values and isinstance(values["storage_options"], dict):
-        values = values["storage_options"]
-    return {str(key): str(value) for key, value in values.items()}
-
-
 def _as_python(value: Any) -> Any:
     return value.as_py() if hasattr(value, "as_py") else value
 
@@ -355,14 +347,12 @@ class InriaRuntimeTargetDataset(Dataset):
 
     def __init__(
         self,
-        lance_uri: str,
-        storage_options: Optional[Dict[str, str]] = None,
+        lance_path: str,
         max_samples: Optional[int] = None,
         validate: bool = True,
         index_scan_batch_size: int = 65536,
     ):
-        self.lance_uri = str(lance_uri)
-        self.storage_options = storage_options
+        self.lance_path = str(lance_path)
         self.validate = bool(validate)
         self.ds = None
 
@@ -380,9 +370,7 @@ class InriaRuntimeTargetDataset(Dataset):
             raise ValueError("No Inria rows with valid_samples == 1000 were found")
 
     def _open_new(self):
-        if self.storage_options is None:
-            return lance.dataset(self.lance_uri)
-        return lance.dataset(self.lance_uri, storage_options=self.storage_options)
+        return lance.dataset(self.lance_path)
 
     @staticmethod
     def _find_full_length_rows(dataset, max_samples: Optional[int], batch_size: int) -> List[int]:

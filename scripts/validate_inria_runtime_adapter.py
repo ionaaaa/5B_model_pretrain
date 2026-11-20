@@ -16,25 +16,22 @@ if REPO_ROOT not in sys.path:
 
 from inria_runtime_dataset import (  # noqa: E402
     InriaRuntimeTargetDataset,
-    load_storage_options,
-)
-
-
-DEFAULT_INRIA_URI = (
-    "s3://omni-eeg-processed-1442740494/"
-    "datasets/inria/releases/pretrain_V1/data.lance"
 )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Read canonical Inria EEG from COS, build FBMAE tokens and targets "
+            "Read canonical Inria EEG from a locally mounted COS path, build "
+            "FBMAE tokens and targets "
             "inside DataLoader workers, and run strict numerical checks."
         )
     )
-    parser.add_argument("--lance-uri", default=DEFAULT_INRIA_URI)
-    parser.add_argument("--storage-options-json", required=True)
+    parser.add_argument(
+        "--lance-path",
+        required=True,
+        help="Mounted local path ending in datasets/inria/releases/pretrain_V1/data.lance",
+    )
     parser.add_argument("--max-samples", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -58,10 +55,12 @@ def main():
     if args.batch_size <= 0 or args.num_workers < 0:
         raise ValueError("invalid batch-size or num-workers")
 
-    storage_options = load_storage_options(args.storage_options_json)
+    if not os.path.exists(args.lance_path):
+        raise FileNotFoundError(
+            f"Mounted Inria Lance path does not exist: {args.lance_path}"
+        )
     dataset = InriaRuntimeTargetDataset(
-        lance_uri=args.lance_uri,
-        storage_options=storage_options,
+        lance_path=args.lance_path,
         max_samples=args.max_samples,
         validate=True,
     )
@@ -125,7 +124,7 @@ def main():
     token_values = np.concatenate(token_values)
 
     print("\n===== Inria runtime FBMAE adapter validation PASSED =====")
-    print("lance_uri:", args.lance_uri)
+    print("lance_path:", args.lance_path)
     print("selected_rows:", len(dataset))
     print("checked_rows:", total_rows)
     print("all rows satisfy valid_samples == 1000: YES")

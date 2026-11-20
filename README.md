@@ -193,29 +193,18 @@ and constructs FBMAE tokens and time-frequency targets inside DataLoader workers
 It selects only rows with `valid_samples == 1000` and never writes a processed
 Lance dataset.
 
-The COS bucket is S3 compatible. Lance therefore uses an `s3://` URI plus a
-storage-options JSON file; `cos://` is only used by `coscli` and is not a Lance
-URI. A storage-options file has the following structure (keep real credentials
-outside the repository):
-
-```json
-{
-  "aws_access_key_id": "<COS_SECRET_ID>",
-  "aws_secret_access_key": "<COS_SECRET_KEY>",
-  "aws_endpoint": "https://cos.ap-beijing.myqcloud.com",
-  "aws_region": "ap-beijing",
-  "aws_virtual_hosted_style_request": "true"
-}
-```
+On Tencent Cloud the COS bucket is mounted into the local filesystem. The
+adapter deliberately opens that mounted path with `lance.dataset(path)` and
+does not use `storage_options`, `s3://`, or a COS SDK.
 
 Tencent Cloud validation entry command:
 
 ```bash
+export COS_MOUNT_ROOT=/actual/tencent/cos/mount/root
 cd /path/to/EEG_pretrain
 
 python scripts/validate_inria_runtime_adapter.py \
-  --lance-uri s3://omni-eeg-processed-1442740494/datasets/inria/releases/pretrain_V1/data.lance \
-  --storage-options-json /path/to/secrets/cos_storage_options.json \
+  --lance-path "${COS_MOUNT_ROOT}/datasets/inria/releases/pretrain_V1/data.lance" \
   --max-samples 128 \
   --batch-size 8 \
   --num-workers 4 \
