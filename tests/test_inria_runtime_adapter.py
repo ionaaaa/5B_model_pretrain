@@ -3,7 +3,11 @@ import unittest
 
 import numpy as np
 
-from inria_runtime_dataset import INRIA_CHANNELS, adapt_inria_row
+from inria_runtime_dataset import (
+    INRIA_CHANNELS,
+    _normalize_valid_samples,
+    adapt_inria_row,
+)
 
 
 def make_row(invalid_channel=None):
@@ -35,6 +39,15 @@ def make_row(invalid_channel=None):
 
 
 class TestInriaRuntimeAdapter(unittest.TestCase):
+    def test_valid_samples_scalar_normalization(self):
+        self.assertEqual(_normalize_valid_samples(1000), 1000)
+        self.assertEqual(_normalize_valid_samples(1000.0), 1000)
+        self.assertEqual(_normalize_valid_samples("1000"), 1000)
+        self.assertEqual(_normalize_valid_samples(b"1000"), 1000)
+        self.assertIsNone(_normalize_valid_samples(None))
+        self.assertIsNone(_normalize_valid_samples(""))
+        self.assertIsNone(_normalize_valid_samples("1000.5"))
+
     def test_shapes_ordering_and_targets(self):
         sample = adapt_inria_row(make_row())
         self.assertEqual(tuple(sample["token_inputs"].shape), (640, 100))

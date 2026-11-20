@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import lance
@@ -44,6 +45,26 @@ SOURCE_COLUMNS: Tuple[str, ...] = (
 
 def _as_python(value: Any) -> Any:
     return value.as_py() if hasattr(value, "as_py") else value
+
+
+def _normalize_valid_samples(value: Any) -> Optional[int]:
+    """Normalize Arrow/Python numeric scalars without changing their meaning."""
+    value = _as_python(value)
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric) or not numeric.is_integer():
+        return None
+    return int(numeric)
 
 
 def _parse_mask_payload(value: Any, channel_names: Sequence[str]) -> np.ndarray:
@@ -360,31 +381,65 @@ class InriaRuntimeTargetDataset(Dataset):
         missing = sorted(set(SOURCE_COLUMNS) - set(dataset.schema.names))
         if missing:
             raise ValueError(f"Source Lance is missing required columns: {missing}")
-        self.source_indices = self._find_full_length_rows(
+        self.source_indices, self.valid_samples_audit = self._find_full_length_rows(
             dataset,
             max_samples=max_samples,
             batch_size=index_scan_batch_size,
         )
         del dataset
         if not self.source_indices:
-            raise ValueError("No Inria rows with valid_samples == 1000 were found")
+            audit = self.valid_samples_audit
+            raise ValueError(
+                "No Inria rows with valid_samples == 1000 were found. "
+                f"scanned_rows={audit['scanned_rows']}, "
+                f"null_or_unparseable={audit['null_or_unparseable']}, "
+                f"numeric_min={audit['numeric_min']}, "
+                f"numeric_max={audit['numeric_max']}, "
+                f"top_values={audit['top_values']}, "
+                f"raw_types={audit['raw_types']}. "
+                "Do not change the filter until the source valid_samples semantics "
+                "have been confirmed."
+            )
 
     def _open_new(self):
         return lance.dataset(self.lance_path)
 
     @staticmethod
-    def _find_full_length_rows(dataset, max_samples: Optional[int], batch_size: int) -> List[int]:
+    def _find_full_length_rows(dataset, max_samples: Optional[int], batch_size: int):
         selected: List[int] = []
         row_offset = 0
+        value_counts: Counter = Counter()
+        raw_type_counts: Counter = Counter()
+        null_or_unparseable = 0
+        numeric_min: Optional[int] = None
+        numeric_max: Optional[int] = None
         scanner = dataset.scanner(columns=["valid_samples"], batch_size=batch_size)
         for batch in scanner.to_batches():
-            values = np.asarray(batch.column(0).to_pylist(), dtype=object)
-            local_indices = np.flatnonzero(values == 1000)
-            selected.extend((row_offset + local_indices).astype(np.int64).tolist())
+            raw_values = batch.column(0).to_pylist()
+            for local_index, raw_value in enumerate(raw_values):
+                raw_type_counts[type(raw_value).__name__] += 1
+                value = _normalize_valid_samples(raw_value)
+                if value is None:
+                    null_or_unparseable += 1
+                    continue
+                value_counts[value] += 1
+                numeric_min = value if numeric_min is None else min(numeric_min, value)
+                numeric_max = value if numeric_max is None else max(numeric_max, value)
+                if value == 1000:
+                    selected.append(row_offset + local_index)
             row_offset += batch.num_rows
             if max_samples is not None and len(selected) >= max_samples:
-                return selected[:max_samples]
-        return selected
+                selected = selected[:max_samples]
+                break
+        audit = {
+            "scanned_rows": row_offset,
+            "null_or_unparseable": null_or_unparseable,
+            "numeric_min": numeric_min,
+            "numeric_max": numeric_max,
+            "top_values": value_counts.most_common(10),
+            "raw_types": raw_type_counts.most_common(10),
+        }
+        return selected, audit
 
     def __len__(self) -> int:
         return len(self.source_indices)

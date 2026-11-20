@@ -78,6 +78,8 @@ def main():
         )
     loader = DataLoader(**loader_kwargs)
 
+    print("valid_samples_scan:", dataset.valid_samples_audit, flush=True)
+
     adaptation_times = []
     target_times = []
     loader_batch_times = []
