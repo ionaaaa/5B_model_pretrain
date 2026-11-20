@@ -1,8 +1,15 @@
+import os
+import socket
+
 import torch
 from contextlib import nullcontext
 import torch.distributed as dist
 import numpy as np
-from masking import generate_block_mask, apply_token_mask
+from masking import generate_block_mask, apply_token_mask, sample_mask_ratio
+
+
+STEP_DEBUG_HOSTNAME = socket.gethostname()
+STEP_DEBUG_LOCAL_RANK = os.environ.get("LOCAL_RANK", "0")
 
 
 def is_distributed():
@@ -11,6 +18,22 @@ def is_distributed():
 
 def is_main_process():
     return (not is_distributed()) or dist.get_rank() == 0
+
+
+def should_log_step_debug(step, total_steps, step_debug_last_n):
+    """Return whether this zero-based loader step is in the final debug window."""
+    return step_debug_last_n > 0 and step >= total_steps - step_debug_last_n
+
+
+def log_step_debug(epoch, step, global_step, state):
+    """Emit a local marker only; never introduce a distributed synchronization."""
+    rank = dist.get_rank() if is_distributed() else 0
+    print(
+        f"[StepDebug] host={STEP_DEBUG_HOSTNAME} rank={rank} "
+        f"local_rank={STEP_DEBUG_LOCAL_RANK} epoch={epoch + 1} "
+        f"step={step + 1} global_step={global_step} state={state}",
+        flush=True,
+    )
 
 
 def autocast_context(device):
@@ -27,11 +50,11 @@ def reduce_mean(value, device):
     return tensor.item()
 
 
-def build_batch_token_mask(batch_size, num_tokens, cfg, device):
+def build_batch_token_mask(batch_size, num_tokens, mask_ratio, device):
     masks = np.stack([
         generate_block_mask(
             num_tokens=num_tokens,
-            mask_ratio=cfg.mask.mask_ratio,
+            mask_ratio=mask_ratio,
         )
         for _ in range(batch_size)
     ], axis=0)
@@ -61,6 +84,7 @@ def forward_loss(
     token_time_indices,
     token_valid_mask,
     device,
+    after_forward_callback=None,
 ):
     with autocast_context(device):
         pred = model(
@@ -68,6 +92,8 @@ def forward_loss(
             token_channel_indices=token_channel_indices,
             token_time_indices=token_time_indices,
         )
+        if after_forward_callback is not None:
+            after_forward_callback()
 
         loss = criterion(
             pred=pred,
@@ -84,12 +110,23 @@ def train_one_epoch(
     criterion,
     device,
     cfg,
+    global_step=0,
+    epoch=0,
 ):
     model.train()
     total_loss = 0.0
     total_steps = len(loader)
 
     for step, batch in enumerate(loader):
+        debug_this_step = should_log_step_debug(
+            step,
+            total_steps,
+            cfg.train.step_debug_last_n,
+        )
+        if debug_this_step:
+            # This runs immediately after the DataLoader yielded the batch.
+            log_step_debug(epoch, step, global_step, "batch_ready")
+
         batch = move_batch_to_device(batch, device)
 
         token_inputs = batch["token_inputs"]                    # [B, S, L]
@@ -99,11 +136,13 @@ def train_one_epoch(
         token_valid_mask = batch["token_valid_mask"]            # [B, S]
 
         B, S, _ = token_inputs.shape
+        # Sample exactly once for this local training batch; all its samples share it.
+        mask_ratio = sample_mask_ratio(cfg.mask, device=device)
 
         token_mask = build_batch_token_mask(
             batch_size=B,
             num_tokens=S,
-            cfg=cfg,
+            mask_ratio=mask_ratio,
             device=device,
         )
 
@@ -111,6 +150,10 @@ def train_one_epoch(
             tokens=token_inputs,
             token_mask=token_mask,
         )
+
+        if debug_this_step:
+            # All local preparation is complete; the next operation enters FSDP.
+            log_step_debug(epoch, step, global_step, "before_forward")
 
         loss = forward_loss(
             model=model,
@@ -121,11 +164,17 @@ def train_one_epoch(
             token_time_indices=token_time_indices,
             token_valid_mask=token_valid_mask,
             device=device,
+            after_forward_callback=(
+                lambda: log_step_debug(epoch, step, global_step, "after_forward")
+                if debug_this_step
+                else None
+            ),
         )
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+        global_step += 1
 
         total_loss += loss.item()
 
@@ -140,12 +189,14 @@ def train_one_epoch(
             print(
                 f"step={current_step}/{total_steps} "
                 f"({progress:.2f}%), "
+                f"global_step={global_step}, "
                 f"loss={loss.item():.6f}, "
+                f"mask_ratio={mask_ratio:.1f}, "
                 f"input_mask_ratio={token_mask.mean().item():.3f}"
             )
 
     local_avg = total_loss / max(1, len(loader))
-    return reduce_mean(local_avg, device)
+    return reduce_mean(local_avg, device), global_step
 
 
 @torch.no_grad()
@@ -169,11 +220,13 @@ def validate_one_epoch(
         token_valid_mask = batch["token_valid_mask"]
 
         B, S, _ = token_inputs.shape
+        # Validation follows the same batch-level masking policy.
+        mask_ratio = sample_mask_ratio(cfg.mask, device=device)
 
         token_mask = build_batch_token_mask(
             batch_size=B,
             num_tokens=S,
-            cfg=cfg,
+            mask_ratio=mask_ratio,
             device=device,
         )
 

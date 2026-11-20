@@ -15,6 +15,10 @@ def load_storage_options(storage_options_path):
     return {k: str(v) for k, v in storage_options.items()}
 
 
+def is_remote_lance_path(path):
+    return str(path).startswith("s3://")
+
+
 class LanceEEGPretrainDataset(Dataset):
     """
     从 Lance 读取已经预处理好的 EEG 预训练样本。
@@ -26,13 +30,13 @@ class LanceEEGPretrainDataset(Dataset):
         if storage_options is None and storage_options_path is not None:
             storage_options = load_storage_options(storage_options_path)
 
-        if storage_options is None:
-            self.ds = lance.dataset(lance_path)
-        else:
+        if is_remote_lance_path(lance_path) and storage_options is not None:
             self.ds = lance.dataset(
                 lance_path,
                 storage_options=storage_options,
             )
+        else:
+            self.ds = lance.dataset(lance_path)
 
         self.length = self.ds.count_rows()
 

@@ -189,3 +189,30 @@
 ### 总结
 
 整个项目实现了一个完整的 EEG 自监督预训练框架。它可以从原始 EEG 数据中提取时空和频谱特征，通过 Token Masking 和 Band Power Trajectory 预测训练 Transformer 模型。训练得到的模型能作为通用表示用于各种下游 EEG 任务，如脑机接口、情绪识别或疾病诊断。每个模块都有明确职责，形成从原始数据到模型预训练的完整流水线。
+
+---
+
+## NCCL timeout diagnostics
+
+在支持这些 PyTorch NCCL Flight Recorder 变量的版本上，FSDP 多卡训练会在
+Python 初始化 NCCL process group 前设置默认值；代码使用 `os.environ.setdefault`，不会覆盖启动环境中已设置的值。
+建议在 `torchrun` 前显式导出，以便子进程从启动时就继承这些配置：
+
+```bash
+export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export TORCH_NCCL_DESYNC_DEBUG=1
+export TORCH_NCCL_TRACE_CPP_STACK=1
+
+torchrun \
+  --nproc_per_node "$MLP_WORKER_GPU" \
+  --master_addr "$MLP_WORKER_0_HOST" \
+  --node_rank "$MLP_ROLE_INDEX" \
+  --master_port "$MLP_WORKER_0_PORT" \
+  --nnodes "$MLP_WORKER_NUM" \
+  largeScale_pretrain_main.py --step-debug-last-n 50
+```
+
+`StepDebug` 默认只记录每个 epoch 最后 50 个 local batch；所有 rank 各自输出
+`batch_ready`、`before_forward`、`after_forward` 三个无同步 marker。设置
+`--step-debug-last-n 0` 可关闭这些日志。

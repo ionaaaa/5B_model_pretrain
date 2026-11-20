@@ -1,3 +1,5 @@
 output/
 __pycache__/
 storage_options.json
+reconstruction_result
+.idea

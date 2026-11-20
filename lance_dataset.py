@@ -19,8 +19,8 @@ def _normalize_s3_endpoint_for_pyarrow(endpoint, bucket=None):
     把 storage_options 里的 endpoint 转成 pyarrow.fs.S3FileSystem 可用的 endpoint_override。
 
     例如：
-        endpoint = "https://jianyu.tos-s3-cn-beijing.ivolces.com"
-        bucket   = "jianyu"
+        endpoint = "https://omni-mnt.tos-s3-cn-beijing.ivolces.com"
+        bucket   = "omni-mnt"
 
     返回：
         "tos-s3-cn-beijing.ivolces.com"
@@ -71,13 +71,27 @@ def load_lance_part_paths(list_file):
     return sorted(part_paths, key=_lance_part_sort_key)
 
 
+def is_remote_lance_path(path):
+    """Return whether a Lance path requires object-store storage options."""
+    return str(path).startswith("s3://")
+
+
 def _normalize_lance_path(path):
     path = str(path)
 
-    if path.endswith(".lance"):
+    # Preserve mounted local paths exactly as written in part_paths.txt.
+    # The trailing slash remains only for legacy S3 Lance URI compatibility.
+    if is_remote_lance_path(path) and path.endswith(".lance"):
         path = path + "/"
 
     return path
+
+
+def _open_lance_dataset(path, storage_options=None):
+    """Open mounted paths locally and retain storage options for S3 URIs only."""
+    if is_remote_lance_path(path) and storage_options is not None:
+        return lance.dataset(path, storage_options=storage_options)
+    return lance.dataset(path)
 
 
 def _lance_part_sort_key(path):
@@ -95,7 +109,7 @@ def _build_pyarrow_s3_options(storage_options=None, bucket=None):
     把 storage_options.json 转成 pyarrow.fs.S3FileSystem 参数。
 
     支持火山 TOS S3 endpoint，例如：
-        "aws_endpoint": "https://jianyu.tos-s3-cn-beijing.ivolces.com"
+        "aws_endpoint": "https://omni-mnt.tos-s3-cn-beijing.ivolces.com"
     """
     if storage_options is None:
         storage_options = {}
@@ -332,23 +346,17 @@ class LanceEEGPretrainDataset(Dataset):
 
     def _open(self):
         if self.ds is None:
-            if self.storage_options is None:
-                self.ds = lance.dataset(self.lance_path)
-            else:
-                self.ds = lance.dataset(
-                    self.lance_path,
-                    storage_options=self.storage_options,
-                )
-        return self.ds
-
-    def _get_length_once(self):
-        if self.storage_options is None:
-            ds = lance.dataset(self.lance_path)
-        else:
-            ds = lance.dataset(
+            self.ds = _open_lance_dataset(
                 self.lance_path,
                 storage_options=self.storage_options,
             )
+        return self.ds
+
+    def _get_length_once(self):
+        ds = _open_lance_dataset(
+            self.lance_path,
+            storage_options=self.storage_options,
+        )
 
         n = ds.count_rows()
         del ds
@@ -517,10 +525,7 @@ class MultiLanceEEGPretrainDataset(Dataset):
         self._datasets = {}
 
     def _open_lance_path(self, path):
-        if self.storage_options is None:
-            return lance.dataset(path)
-
-        return lance.dataset(
+        return _open_lance_dataset(
             path,
             storage_options=self.storage_options,
         )

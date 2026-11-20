@@ -180,15 +180,27 @@ class EEGPretrainModel(nn.Module):
         Returns:
             pred: [B, S, F, K]
         """
-        x = self.tokenizer(token_inputs)
+        x = self.extract_token_embeddings(
+            token_inputs=token_inputs,
+            token_channel_indices=token_channel_indices,
+            token_time_indices=token_time_indices,
+        )
+        return self.head(x)
 
+    def extract_token_embeddings(
+        self,
+        token_inputs,
+        token_channel_indices,
+        token_time_indices,
+    ):
+        """Return the final Transformer encoder tokens before reconstruction.
+
+        Args are identical to :meth:`forward`; the result is ``[B, S, d_model]``.
+        This is deliberately the shared implementation used by ``forward`` so
+        downstream probes do not need hooks or a copy of the model internals.
+        """
+        x = self.tokenizer(token_inputs)
         ch_pos = self.channel_embed(token_channel_indices)
         time_pos = self.time_embed(token_time_indices)
-
         x = x + ch_pos + time_pos
-
-        x = self.encoder(x)
-
-        pred = self.head(x)
-
-        return pred
+        return self.encoder(x)

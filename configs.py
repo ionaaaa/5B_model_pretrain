@@ -45,7 +45,12 @@ class MaskConfig:
     """
     mask 相关配置。
     """
-    mask_ratio: float = 0.75
+    mask_ratios: list[float] = field(
+        default_factory=lambda: [0.6, 0.7, 0.8, 0.9]
+    )
+    mask_ratio_weights: list[float] = field(
+        default_factory=lambda: [1.0, 2.0, 3.0, 4.0]
+    )
     min_block_tokens: int = 4
     max_block_tokens: int = 32
 
@@ -55,9 +60,9 @@ class ModelConfig:
     """
     模型相关配置。
     """
-    d_model: int = 2048
+    d_model: int = 4096
     n_heads: int = 16
-    depth: int = 20
+    depth: int = 25
     mlp_ratio: float = 4.0
     dropout: float = 0.1
 
@@ -70,7 +75,7 @@ class TrainConfig:
     seed: int = 42
     device: str = "cuda"
 
-    batch_size: int = 64
+    batch_size: int = 32
     num_workers: int = 8
     pin_memory: bool = True
     persistent_workers: bool = True
@@ -81,16 +86,19 @@ class TrainConfig:
     use_prefetch_loader: bool = True
     prefetch: int = 2
 
-    num_epochs: int = 5
+    num_epochs: int = 10
 
-    lr: float = 1e-4
+    lr: float = 5e-5
     weight_decay: float = 1e-5
 
-    print_every: int = 5
+    print_every: int = 50
+    # Per-rank, non-synchronizing diagnostics for the final batches of an epoch.
+    # Set to 0 to disable StepDebug logging.
+    step_debug_last_n: int = 50
 
-    output_root: str = "/vePFS-0x0d/home/mwx/workspace/EEG_pretrain/output"
-    save_path: str = ""
-    vis_dir: str = ""
+    output_root: str = "/tos/mnt/LargeScalePretrainResults_5B"
+    save_path: str = "/tos/mnt/LargeScalePretrainResults_5B"
+    vis_dir: str = "/tos/mnt/LargeScalePretrainResults_5B"
 
 
 @dataclass

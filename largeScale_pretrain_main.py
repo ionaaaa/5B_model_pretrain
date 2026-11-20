@@ -6,7 +6,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
@@ -19,21 +18,109 @@ from prefetch_loader import PrefetchLoader
 
 from model import EEGPretrainModel
 from losses import BalancedBandTokenTrajectoryLoss
+from fsdp_utils import (
+    build_fsdp_model,
+    fresh_training_state,
+    restore_training_checkpoint,
+    save_model_checkpoint,
+)
 from trainer import train_one_epoch, validate_one_epoch
-from masking import generate_block_mask, apply_token_mask
+from masking import (
+    generate_block_mask,
+    apply_token_mask,
+    expected_mask_ratio,
+    sample_mask_ratio,
+    validate_mask_config,
+)
 from utils import set_seed, ensure_dir_for_file
 
 from lance_dataset import (
     MultiLanceEEGPretrainDataset,
     PartAwareDistributedBatchSampler,
+    is_remote_lance_path,
     load_storage_options,
     load_lance_part_paths,
 )
 
 
+NCCL_FLIGHT_RECORDER_DEFAULTS = {
+    "TORCH_NCCL_TRACE_BUFFER_SIZE": "2000",
+    "TORCH_NCCL_DUMP_ON_TIMEOUT": "1",
+    "TORCH_NCCL_DESYNC_DEBUG": "1",
+    "TORCH_NCCL_TRACE_CPP_STACK": "1",
+}
+
+
+def configure_nccl_flight_recorder_defaults():
+    """Set diagnostic defaults before ProcessGroupNCCL initialization.
+
+    ``setdefault`` deliberately preserves values supplied by the launch shell.
+    """
+    for name, value in NCCL_FLIGHT_RECORDER_DEFAULTS.items():
+        os.environ.setdefault(name, value)
+
+
+def log_nccl_flight_recorder_status(rank):
+    """Report the actual effective diagnostic environment on rank 0."""
+    if not is_main_process(rank):
+        return
+    print("[NCCL Debug]")
+    print(f"PyTorch={torch.__version__}")
+    for name in NCCL_FLIGHT_RECORDER_DEFAULTS:
+        print(f"{name}={os.environ.get(name, '<unset>')}")
+
+
+def resolve_use_prefetch_loader(cli_value, config_value):
+    """Use an explicit CLI selection when present, otherwise keep config behavior."""
+    return bool(config_value) if cli_value is None else bool(cli_value)
+
+
+def maybe_wrap_prefetch_loaders(
+    train_loader,
+    val_loader,
+    *,
+    use_prefetch_loader,
+    device,
+    prefetch,
+):
+    """Optionally add only the project's custom PrefetchLoader wrapper."""
+    if not use_prefetch_loader:
+        return train_loader, val_loader
+    return (
+        PrefetchLoader(train_loader, device=device, prefetch=prefetch),
+        PrefetchLoader(val_loader, device=device, prefetch=prefetch),
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_rank", "--local-rank", type=int, default=None)
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to an epoch-complete FSDP/full-model checkpoint.",
+    )
+    parser.add_argument(
+        "--step-debug-last-n",
+        type=int,
+        default=None,
+        help="Emit per-rank StepDebug markers for the final N training batches; 0 disables it.",
+    )
+    prefetch_group = parser.add_mutually_exclusive_group()
+    prefetch_group.add_argument(
+        "--use-prefetch-loader",
+        dest="use_prefetch_loader",
+        action="store_true",
+        help="Force the project's custom PrefetchLoader on.",
+    )
+    prefetch_group.add_argument(
+        "--no-prefetch-loader",
+        dest="use_prefetch_loader",
+        action="store_false",
+        help="Disable only the project's custom PrefetchLoader wrapper.",
+    )
+    parser.set_defaults(use_prefetch_loader=None)
     args, _ = parser.parse_known_args()
     return args
 
@@ -76,7 +163,7 @@ def rank0_print(rank, *args, **kwargs):
         print(*args, **kwargs)
 
 
-def configure_run_outputs(cfg, rank, ddp):
+def configure_run_outputs(cfg, rank, distributed):
     output_root = getattr(
         cfg.train,
         "output_root",
@@ -87,7 +174,7 @@ def configure_run_outputs(cfg, rank, ddp):
     if is_main_process(rank):
         run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    if ddp:
+    if distributed:
         obj_list = [run_name]
         dist.broadcast_object_list(obj_list, src=0)
         run_name = obj_list[0]
@@ -101,7 +188,7 @@ def configure_run_outputs(cfg, rank, ddp):
         os.makedirs(os.path.dirname(cfg.train.save_path), exist_ok=True)
         os.makedirs(cfg.train.vis_dir, exist_ok=True)
 
-    if ddp:
+    if distributed:
         dist.barrier()
 
     return run_dir
@@ -161,12 +248,12 @@ def compute_shape_params(cfg):
     }
 
 
-def build_batch_token_mask(batch_size, num_tokens, cfg, device):
+def build_batch_token_mask(batch_size, num_tokens, mask_ratio, device):
     masks = []
     for _ in range(batch_size):
         mask = generate_block_mask(
             num_tokens=num_tokens,
-            mask_ratio=cfg.mask.mask_ratio,
+            mask_ratio=mask_ratio,
         )
         masks.append(mask)
 
@@ -198,8 +285,9 @@ def visualize_train_reconstruction(
     device,
     save_dir,
     max_samples=4,
+    save_outputs=True,
+    artifact_tag=None,
 ):
-    os.makedirs(save_dir, exist_ok=True)
     model.eval()
 
     batch = next(iter(loader))
@@ -213,7 +301,8 @@ def visualize_train_reconstruction(
 
     B, S, _ = token_inputs.shape
 
-    token_mask = build_batch_token_mask(B, S, cfg, device)
+    mask_ratio = sample_mask_ratio(cfg.mask, device=device)
+    token_mask = build_batch_token_mask(B, S, mask_ratio, device)
     masked_inputs = apply_token_mask(tokens=token_inputs, token_mask=token_mask)
 
     pred_norm = model(
@@ -222,7 +311,16 @@ def visualize_train_reconstruction(
         token_time_indices=token_time_indices,
     )
 
-    pred = pred_norm.detach().cpu().numpy()
+    # FSDP requires every rank to participate in the forward above. Only rank 0
+    # needs the following CPU conversion and image output.
+    if not save_outputs:
+        return
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    # NumPy cannot directly represent CUDA/CPU bfloat16 tensors produced by
+    # FSDP BF16 mixed precision; FP32 is only used for plotting.
+    pred = pred_norm.detach().float().cpu().numpy()
     target = targets.detach().cpu().numpy()
     token_mask_np = token_mask.detach().cpu().numpy()
     token_valid_np = token_valid_mask.detach().cpu().numpy()
@@ -286,7 +384,10 @@ def visualize_train_reconstruction(
                     ax.legend()
 
         plt.tight_layout()
-        save_path = os.path.join(save_dir, f"train_reconstruction_sample_{b}.png")
+        file_stem = "train_reconstruction_sample"
+        if artifact_tag:
+            file_stem = f"{artifact_tag}_{file_stem}"
+        save_path = os.path.join(save_dir, f"{file_stem}_{b}.png")
         plt.savefig(save_path, dpi=150)
         plt.close(fig)
         print(f"[Visualization] saved: {save_path}")
@@ -294,15 +395,32 @@ def visualize_train_reconstruction(
 
 def build_dataset(cfg, rank):
     if cfg.data.use_multi_lance_parts:
-        storage_options = load_storage_options(cfg.data.storage_options_path)
         part_paths = load_lance_part_paths(cfg.data.lance_part_list_file)
         if len(part_paths) == 0:
             raise ValueError(
                 f"No Lance parts found in "
                 f"{cfg.data.lance_part_list_file!r}."
             )
-        rank0_print(rank, "lance_part_list_file:", cfg.data.lance_part_list_file)
-        rank0_print(rank, "lance_parts:", len(part_paths))
+
+        first_part_path = part_paths[0]
+        has_remote_parts = any(is_remote_lance_path(path) for path in part_paths)
+        storage_options = (
+            load_storage_options(cfg.data.storage_options_path)
+            if has_remote_parts
+            else None
+        )
+
+        rank0_print(rank, "[MultiLance] lance_part_list_file:", cfg.data.lance_part_list_file)
+        rank0_print(rank, f"[MultiLance] loaded {len(part_paths)} lance parts")
+        rank0_print(rank, "[MultiLance] first part:", first_part_path)
+
+        if not is_remote_lance_path(first_part_path) and not os.path.exists(first_part_path):
+            raise FileNotFoundError(
+                "Lance part does not exist:\n"
+                f"  {first_part_path}\n\n"
+                "Expected mount root:\n"
+                "  /tos/mnt"
+            )
 
         dataset = MultiLanceEEGPretrainDataset(
             lance_paths=part_paths,
@@ -344,10 +462,23 @@ def count_parameters(model):
 
 def main():
     args = parse_args()
-    ddp, rank, world_size, local_rank, device = setup_distributed(args.local_rank)
+    # ProcessGroupNCCL reads its diagnostics configuration during initialization.
+    # torchrun starts this Python process before that point, so this is early
+    # enough while still preserving explicit launcher-provided values.
+    configure_nccl_flight_recorder_defaults()
+    distributed, rank, world_size, local_rank, device = setup_distributed(args.local_rank)
 
     cfg = Config()
-    run_dir = configure_run_outputs(cfg, rank, ddp)
+    if args.step_debug_last_n is not None:
+        if args.step_debug_last_n < 0:
+            raise ValueError("--step-debug-last-n must be greater than or equal to 0")
+        cfg.train.step_debug_last_n = args.step_debug_last_n
+    cfg.train.use_prefetch_loader = resolve_use_prefetch_loader(
+        args.use_prefetch_loader,
+        cfg.train.use_prefetch_loader,
+    )
+    validate_mask_config(cfg.mask)
+    run_dir = configure_run_outputs(cfg, rank, distributed)
     set_seed(cfg.train.seed + rank)
     enable_cuda_attention_kernels(rank)
 
@@ -357,8 +488,11 @@ def main():
     rank0_print(rank, "Visualization dir:", cfg.train.vis_dir)
     rank0_print(
         rank,
-        f"Distributed: {ddp}, rank={rank}, world_size={world_size}, local_rank={local_rank}",
+        f"Distributed: {distributed}, rank={rank}, world_size={world_size}, local_rank={local_rank}",
     )
+    if distributed:
+        log_nccl_flight_recorder_status(rank)
+    rank0_print(rank, f"StepDebug final batches per epoch: {cfg.train.step_debug_last_n}")
 
     shape_params = compute_shape_params(cfg)
 
@@ -487,30 +621,35 @@ def main():
     base_val_loader = DataLoader(**val_loader_kwargs)
 
     rank0_print(rank, f"PartAwareDistributedBatchSampler enabled: train_batches={len(train_batch_sampler)}, val_batches={len(val_batch_sampler)}")
-    rank0_print(rank, f"DataLoader workers={num_workers}, pin_memory={pin_memory}, prefetch_factor={prefetch_factor if num_workers > 0 else None}")
-
-    use_prefetch_loader = getattr(cfg.train, "use_prefetch_loader", True)
+    use_prefetch_loader = cfg.train.use_prefetch_loader
     prefetch = getattr(cfg.train, "prefetch", 2)
+    train_loader, val_loader = maybe_wrap_prefetch_loaders(
+        base_train_loader,
+        base_val_loader,
+        use_prefetch_loader=use_prefetch_loader,
+        device=device,
+        prefetch=prefetch,
+    )
 
+    rank0_print(
+        rank,
+        "[DataLoaderConfig] "
+        f"use_prefetch_loader={use_prefetch_loader} "
+        f"num_workers={num_workers} "
+        f"prefetch_factor={prefetch_factor if num_workers > 0 else None} "
+        f"persistent_workers={persistent_workers if num_workers > 0 else False} "
+        f"pin_memory={pin_memory}",
+    )
     if use_prefetch_loader:
-        train_loader = PrefetchLoader(
-            base_train_loader,
-            device=device,
-            prefetch=prefetch,
-        )
-        val_loader = PrefetchLoader(
-            base_val_loader,
-            device=device,
-            prefetch=prefetch,
-        )
-        rank0_print(rank, f"PrefetchLoader enabled: prefetch={prefetch}")
+        rank0_print(rank, f"[DataLoaderConfig] custom PrefetchLoader enabled; prefetch={prefetch}")
     else:
-        train_loader = base_train_loader
-        val_loader = base_val_loader
-        rank0_print(rank, "PrefetchLoader disabled")
+        rank0_print(
+            rank,
+            "[DataLoaderConfig] custom PrefetchLoader disabled; using raw PyTorch DataLoader",
+        )
 
     rank0_print(rank, "\n===== Building Model =====")
-    model = EEGPretrainModel(
+    raw_model = EEGPretrainModel(
         input_dim=patch_len,
         d_model=cfg.model.d_model,
         n_heads=cfg.model.n_heads,
@@ -521,9 +660,9 @@ def main():
         n_time_patches=num_time_patches,
         n_bands=n_bands,
         frames_per_patch=frames_per_patch,
-    ).to(device)
+    )
 
-    total_params = count_parameters(model)
+    total_params = count_parameters(raw_model)
 
     rank0_print(rank, " ")
     rank0_print(rank, "--------------------------------------------------------------------------")
@@ -531,13 +670,29 @@ def main():
     rank0_print(rank, "--------------------------------------------------------------------------")
     rank0_print(rank, " ")
 
-    if ddp:
-        model = DDP(
-            model,
-            device_ids=[local_rank],
-            output_device=local_rank,
-        )
+    rank0_print(rank, f"Dynamic mask ratios: {cfg.mask.mask_ratios}")
+    rank0_print(rank, f"Dynamic mask weights: {cfg.mask.mask_ratio_weights}")
+    rank0_print(rank, f"Expected mask ratio: {expected_mask_ratio(cfg.mask):.4f}")
+    rank0_print(rank, "Sampling frequency: once per training batch")
 
+    if distributed:
+        model = build_fsdp_model(raw_model, device=device)
+        print(
+            f"[FSDP] rank={rank} local_rank={local_rank} device={device}",
+            flush=True,
+        )
+        rank0_print(rank, "Distributed mode: FSDP")
+        rank0_print(rank, "FSDP sharding strategy: FULL_SHARD")
+        rank0_print(rank, "FSDP auto-wrap block: TransformerEncoderLayer")
+        rank0_print(rank, "FSDP mixed precision: BF16")
+        rank0_print(rank, "Activation checkpointing: disabled")
+        rank0_print(rank, "CPU offload: disabled")
+        rank0_print(rank, f"World size: {world_size}")
+    else:
+        model = raw_model.to(device)
+        rank0_print(rank, "Distributed mode: single-process (FSDP inactive)")
+
+    # Optimizer construction deliberately follows FSDP wrapping.
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.train.lr,
@@ -546,27 +701,101 @@ def main():
 
     criterion = BalancedBandTokenTrajectoryLoss()
 
+    training_state = fresh_training_state()
+    if args.resume:
+        training_state = restore_training_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            path=args.resume,
+            steps_per_epoch=len(train_loader),
+        )
+        rank0_print(rank, "\n===== Resume Training =====")
+        rank0_print(rank, f"[Resume] checkpoint: {args.resume}")
+        rank0_print(rank, f"[Resume] checkpoint version: {training_state['checkpoint_version']}")
+        rank0_print(rank, f"[Resume] checkpoint epoch: {training_state['checkpoint_epoch']}")
+        rank0_print(rank, f"[Resume] start epoch: {training_state['start_epoch']}")
+        rank0_print(rank, "[Resume] model state: restored")
+        if training_state["optimizer_restored"]:
+            rank0_print(rank, "[Resume] optimizer state: restored")
+        else:
+            rank0_print(
+                rank,
+                "[Resume] optimizer state: not found; using freshly initialized AdamW",
+            )
+        rank0_print(rank, f"[Resume] global step: {training_state['global_step']}")
+        for warning in training_state["warnings"]:
+            rank0_print(rank, f"[Resume] warning: {warning}")
+
+    start_epoch = training_state["start_epoch"]
+    global_step = training_state["global_step"]
+    best_val = training_state["best_val"]
+
     rank0_print(rank, "\n===== Start Training =====")
-    best_val = float("inf")
 
     if is_main_process(rank):
         ensure_dir_for_file(cfg.train.save_path)
-    if ddp:
+    if distributed:
         dist.barrier()
 
-    for epoch in range(cfg.train.num_epochs):
+    base_dir = os.path.dirname(cfg.train.save_path)
+    base_name = os.path.basename(cfg.train.save_path).replace(".pt", "")
+
+    if args.resume is None:
+        # Save the randomly initialized model and its reconstruction before any
+        # optimization step. FSDP checkpointing/forward remains collective.
+        initial_checkpoint_path = os.path.join(base_dir, f"{base_name}_initial.pt")
+        save_model_checkpoint(
+            model=model,
+            path=initial_checkpoint_path,
+            rank=rank,
+            extra_state={
+                "config": cfg,
+                "shape_params": shape_params,
+                "epoch": None,
+                "phase": "before_training",
+                "global_step": global_step,
+                "best_val": best_val,
+                "train_loss": None,
+                "val_loss": None,
+            },
+        )
+        if is_main_process(rank):
+            print(f"Saved initial model to {initial_checkpoint_path}")
+        if distributed:
+            dist.barrier()
+
+        if is_main_process(rank):
+            print("\n===== Visualizing Initial Reconstruction =====")
+        visualize_train_reconstruction(
+            model=model,
+            loader=train_loader,
+            cfg=cfg,
+            device=device,
+            save_dir=cfg.train.vis_dir,
+            max_samples=4,
+            save_outputs=is_main_process(rank),
+            artifact_tag="before_training",
+        )
+        if distributed:
+            dist.barrier()
+    else:
+        rank0_print(rank, "[Resume] skipping fresh-run initial checkpoint and visualization")
+
+    for epoch in range(start_epoch, cfg.train.num_epochs):
         if hasattr(train_batch_sampler, "set_epoch"):
             train_batch_sampler.set_epoch(epoch)
 
         rank0_print(rank, f"\n===== Epoch {epoch + 1}/{cfg.train.num_epochs} =====")
 
-        train_loss = train_one_epoch(
+        train_loss, global_step = train_one_epoch(
             model=model,
             loader=train_loader,
             optimizer=optimizer,
             criterion=criterion,
             device=device,
             cfg=cfg,
+            global_step=global_step,
+            epoch=epoch,
         )
 
         val_loss = validate_one_epoch(
@@ -579,41 +808,62 @@ def main():
 
         rank0_print(rank, f"Epoch {epoch + 1}: train_loss={train_loss:.6f}, val_loss={val_loss:.6f}")
 
-        base_dir = os.path.dirname(cfg.train.save_path)
-        base_name = os.path.basename(cfg.train.save_path).replace(".pt", "")
-        save_path = os.path.join(base_dir, f"{base_name}_{epoch}.pt")
-
-        if is_main_process(rank):
-            model_to_save = model.module if ddp else model
-            torch.save(
-                {
-                    "model_state_dict": model_to_save.state_dict(),
-                    "config": cfg,
-                    "shape_params": shape_params,
-                    "epoch": epoch,
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                },
-                save_path,
-            )
-
-            print(f"Saved model to {save_path}")
-
         if val_loss < best_val:
             best_val = val_loss
 
-    if is_main_process(rank):
-        print("\n===== Visualizing Train Reconstruction =====")
-        model_to_vis = model.module if ddp else model
+        save_path = os.path.join(base_dir, f"{base_name}_{epoch}.pt")
+
+        save_model_checkpoint(
+            model=model,
+            path=save_path,
+            rank=rank,
+            extra_state={
+                "config": cfg,
+                "shape_params": shape_params,
+                "epoch": epoch,
+                "global_step": global_step,
+                "best_val": best_val,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+            },
+        )
+        if is_main_process(rank):
+            print(f"Saved model to {save_path}")
+        if distributed:
+            dist.barrier()
+
+        if is_main_process(rank):
+            print(f"\n===== Visualizing Epoch {epoch + 1} Reconstruction =====")
         visualize_train_reconstruction(
-            model=model_to_vis,
+            model=model,
             loader=train_loader,
             cfg=cfg,
             device=device,
             save_dir=cfg.train.vis_dir,
             max_samples=4,
+            save_outputs=is_main_process(rank),
+            artifact_tag=f"epoch_{epoch + 1:03d}",
         )
+        if distributed:
+            dist.barrier()
 
+    if is_main_process(rank):
+        print("\n===== Visualizing Train Reconstruction =====")
+    # FSDP forward is collective, so all ranks participate; only rank 0 writes.
+    visualize_train_reconstruction(
+        model=model,
+        loader=train_loader,
+        cfg=cfg,
+        device=device,
+        save_dir=cfg.train.vis_dir,
+        max_samples=4,
+        save_outputs=is_main_process(rank),
+        artifact_tag="final",
+    )
+    if distributed:
+        dist.barrier()
+
+    if is_main_process(rank):
         print("\nDone.")
         print(f"Best val loss: {best_val:.6f}")
         print(f"Visualization saved to: {cfg.train.vis_dir}")
