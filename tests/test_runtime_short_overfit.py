@@ -76,6 +76,7 @@ class TestRuntimeShortOverfit(unittest.TestCase):
             steps=2,
             batch_size=2,
             min_loss_drop=-1.0,
+            min_zero_baseline_advantage=-1.0,
             min_shuffle_advantage=-1.0,
         )
         result = run_short_overfit(data, args)

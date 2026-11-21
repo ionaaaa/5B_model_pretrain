@@ -228,7 +228,7 @@ the same initialization, batch schedule, token masks, and optimizer settings.
 python scripts/validate_runtime_short_overfit.py \
   --dataset inria \
   --lance-path "${COS_MOUNT_ROOT}/datasets/inria/releases/pretrain_V1/data.lance" \
-  --samples 32 \
+  --samples 16 \
   --steps 60 \
   --batch-size 8 \
   --num-workers 4 \
@@ -236,16 +236,21 @@ python scripts/validate_runtime_short_overfit.py \
   --d-model 64 \
   --n-heads 4 \
   --depth 2 \
-  --mask-ratio 0.8 \
+  --mask-ratio 0.0 \
   --learning-rate 1e-3 \
   --eval-every 10 \
   --device cpu
 ```
 
-The command fails if aligned fixed-mask evaluation loss does not drop by at
-least 10%, or if its final loss is not lower than the shuffled-target control.
-It also fails immediately on non-finite tensors, losses, gradients, or model
-parameters. `egobrain` and `shin2017a` remain blocked until their layer-1
+This alignment sanity test deliberately uses no random input masking so that a
+short run can distinguish the true token/target relationship from the negative
+control. The earlier one-step test already validates the production masking
+path. The command fails unless aligned fixed-mask evaluation loss drops by at
+least 10%, beats a zero predictor by at least 10%, and beats the shuffled-target
+control by at least 5%. A separate run with `--mask-ratio 0.8` is useful as a
+numerical stability check, but is not accepted as evidence of target alignment.
+The script also fails immediately on non-finite tensors, losses, gradients, or
+model parameters. `egobrain` and `shin2017a` remain blocked until their layer-1
 runtime adapters are validated. `ds004408` is explicitly blocked until its
 electrode coordinate/channel mapping is established.
 

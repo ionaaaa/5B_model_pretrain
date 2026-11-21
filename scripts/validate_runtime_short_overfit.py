@@ -54,7 +54,7 @@ def parse_args():
         default="inria",
     )
     parser.add_argument("--lance-path", required=True)
-    parser.add_argument("--samples", type=int, default=32)
+    parser.add_argument("--samples", type=int, default=16)
     parser.add_argument("--steps", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
@@ -62,11 +62,20 @@ def parse_args():
     parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--depth", type=int, default=2)
-    parser.add_argument("--mask-ratio", type=float, default=0.8)
+    parser.add_argument(
+        "--mask-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Use 0.0 for the alignment sanity test. Production-like 0.8 masking "
+            "is a separate stability test and may hide aligned/shuffled differences."
+        ),
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--eval-every", type=int, default=10)
     parser.add_argument("--min-loss-drop", type=float, default=0.10)
-    parser.add_argument("--min-shuffle-advantage", type=float, default=0.0)
+    parser.add_argument("--min-zero-baseline-advantage", type=float, default=0.10)
+    parser.add_argument("--min-shuffle-advantage", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=20261121)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     return parser.parse_args()
@@ -367,17 +376,33 @@ def run_short_overfit(data, args):
         "shuffled", data, shuffled_map, schedule, training_masks,
         eval_batches, eval_masks, args, device,
     )
+    criterion = BalancedBandTokenTrajectoryLoss()
+    with torch.no_grad():
+        zero_baseline_loss = float(
+            criterion(
+                pred=torch.zeros_like(data["targets"]),
+                target=data["targets"],
+                token_valid_mask=data["token_valid_mask"],
+            )
+        )
+    zero_baseline_advantage = (
+        zero_baseline_loss - aligned["final_loss"]
+    ) / max(abs(zero_baseline_loss), 1e-12)
     shuffle_advantage = (
         shuffled["final_loss"] - aligned["final_loss"]
     ) / max(abs(shuffled["final_loss"]), 1e-12)
     aligned_drop_pass = aligned["relative_drop"] >= args.min_loss_drop
-    shuffle_pass = shuffle_advantage > args.min_shuffle_advantage
+    zero_baseline_pass = zero_baseline_advantage >= args.min_zero_baseline_advantage
+    shuffle_pass = shuffle_advantage >= args.min_shuffle_advantage
     return {
         "data_stats": stats,
         "aligned": aligned,
         "shuffled": shuffled,
+        "zero_baseline_loss": zero_baseline_loss,
+        "zero_baseline_advantage": zero_baseline_advantage,
         "shuffle_advantage": shuffle_advantage,
         "aligned_drop_pass": aligned_drop_pass,
+        "zero_baseline_pass": zero_baseline_pass,
         "shuffle_pass": shuffle_pass,
     }
 
@@ -403,6 +428,13 @@ def main():
         raise ValueError("--mask-ratio must satisfy 0 <= ratio < 1")
     if args.learning_rate <= 0:
         raise ValueError("--learning-rate must be positive")
+    if args.mask_ratio > 0.5:
+        print(
+            "WARNING: mask_ratio > 0.5 is useful for production-like stability, "
+            "but is too strong for a decisive short alignment-overfit test. "
+            "Use --mask-ratio 0.0 for the alignment diagnostic.",
+            flush=True,
+        )
 
     data = _load_real_samples(args)
     result = run_short_overfit(data, args)
@@ -438,9 +470,15 @@ def main():
         f"initial={shuffled['initial_loss']:.6f} final={shuffled['final_loss']:.6f} "
         f"drop={100.0 * shuffled['relative_drop']:.2f}%",
     )
+    print("zero_predictor_loss:", f"{result['zero_baseline_loss']:.6f}")
+    print(
+        "aligned_advantage_over_zero_predictor:",
+        f"{100.0 * result['zero_baseline_advantage']:.2f}%",
+    )
     print("aligned_advantage_over_shuffled:", f"{100.0 * result['shuffle_advantage']:.2f}%")
     print("finite predictions/loss/gradients/parameters: PASS")
     print("aligned_loss_drop:", "PASS" if result["aligned_drop_pass"] else "FAIL")
+    print("aligned_beats_zero_predictor:", "PASS" if result["zero_baseline_pass"] else "FAIL")
     print("aligned_better_than_shuffled:", "PASS" if result["shuffle_pass"] else "FAIL")
     print("No 5B model was constructed. No processed Lance was written.")
 
@@ -448,6 +486,12 @@ def main():
     if not result["aligned_drop_pass"]:
         failures.append(
             f"aligned loss drop {aligned['relative_drop']:.4f} < {args.min_loss_drop:.4f}"
+        )
+    if not result["zero_baseline_pass"]:
+        failures.append(
+            f"aligned advantage over zero predictor "
+            f"{result['zero_baseline_advantage']:.4f} < "
+            f"{args.min_zero_baseline_advantage:.4f}"
         )
     if not result["shuffle_pass"]:
         failures.append(
