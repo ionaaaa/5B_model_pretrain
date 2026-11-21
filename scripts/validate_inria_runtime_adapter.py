@@ -75,6 +75,10 @@ def main():
         loader_kwargs.update(
             prefetch_factor=args.prefetch_factor,
             persistent_workers=True,
+            # Lance is not fork-safe.  Linux DataLoader defaults to ``fork``,
+            # which can leave workers blocked after the parent has opened the
+            # source dataset while building the valid-row index.
+            multiprocessing_context="spawn",
         )
     loader = DataLoader(**loader_kwargs)
 
