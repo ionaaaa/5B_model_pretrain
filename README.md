@@ -188,6 +188,39 @@
 
 ## Inria canonical Lance runtime adaptation
 
+### Read-only canonical Lance schema probe
+
+Before adding a dataset decoder, compare the mounted physical schemas and scan
+the semantic fields without downloading or writing Lance data:
+
+```bash
+export COS_MOUNT_ROOT=/opt/ml/omni-eeg-processed
+
+python scripts/probe_canonical_lance_schemas.py \
+  --cos-mount-root "${COS_MOUNT_ROOT}" \
+  --datasets inria egobrain shin2017a \
+  --release pretrain_V1 \
+  --head-rows 4 \
+  --max-scan-rows 100000 \
+  --scan-batch-size 8192
+```
+
+The probe reports the Arrow physical type and metadata of every field, sampled
+row shapes, directly stored sampling-rate/channel-name evidence, observed
+channel-index ranges, and the `valid_samples` distribution. Registry hints are
+printed separately from facts established directly from Lance. Set
+`--max-scan-rows 0` only when a full distribution scan is desired.
+
+Runtime adaptation is split into two explicit layers:
+
+```text
+dataset row -> dataset decoder -> CanonicalEEGWindow -> SharedFBMAECore
+```
+
+`InriaDecoder` owns Inria field/catalog semantics. `SharedFBMAECore` owns the
+standard-64 mapping, channel-major patches, runtime targets, indices, and
+masks. Existing `adapt_inria_row` callers remain compatible.
+
 `inria_runtime_dataset.py` reads the Inria `pretrain_V1` canonical Lance release
 and constructs FBMAE tokens and time-frequency targets inside DataLoader workers.
 It selects only rows with `valid_samples == 1000` and never writes a processed

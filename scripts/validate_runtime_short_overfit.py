@@ -40,6 +40,7 @@ TENSOR_FIELDS = (
     "token_valid_mask",
     "channel_valid_mask",
 )
+ROW_TIMING_FIELDS = ("adaptation_time_ms", "target_time_ms")
 
 
 def parse_args():
@@ -98,12 +99,26 @@ def _reject_unready_dataset(dataset_name: str):
         raise RuntimeError(f"Unsupported dataset: {dataset_name}")
 
 
-def _load_real_samples(args) -> Dict[str, torch.Tensor]:
+def _distribution_summary(values: torch.Tensor) -> Dict[str, float]:
+    values = values.detach().cpu().double().numpy()
+    return {
+        "mean": float(values.mean()),
+        "p50": float(np.percentile(values, 50)),
+        "p95": float(np.percentile(values, 95)),
+        "max": float(values.max()),
+        "sum": float(values.sum()),
+    }
+
+
+def _load_real_samples(args):
+    load_started = time.perf_counter()
+    index_scan_started = time.perf_counter()
     dataset = InriaRuntimeTargetDataset(
         lance_path=args.lance_path,
         max_samples=args.samples,
         validate=True,
     )
+    index_scan_seconds = time.perf_counter() - index_scan_started
     loader_kwargs = {
         "dataset": dataset,
         "batch_size": min(args.batch_size, args.samples),
@@ -120,15 +135,31 @@ def _load_real_samples(args) -> Dict[str, torch.Tensor]:
 
     print("valid_samples_scan:", dataset.valid_samples_audit, flush=True)
     pieces = {field: [] for field in TENSOR_FIELDS}
+    timing_pieces = {field: [] for field in ROW_TIMING_FIELDS}
+    materialization_started = time.perf_counter()
     for batch in DataLoader(**loader_kwargs):
         for field in TENSOR_FIELDS:
             pieces[field].append(batch[field].cpu())
+        for field in ROW_TIMING_FIELDS:
+            timing_pieces[field].append(batch[field].cpu().reshape(-1))
+    materialization_seconds = time.perf_counter() - materialization_started
     cached = {field: torch.cat(values, dim=0) for field, values in pieces.items()}
     if cached["token_inputs"].shape[0] != args.samples:
         raise AssertionError(
             f"loaded {cached['token_inputs'].shape[0]} samples, expected {args.samples}"
         )
-    return cached
+    timing = {
+        "index_scan_seconds": index_scan_seconds,
+        "materialization_seconds": materialization_seconds,
+        "total_data_prepare_seconds": time.perf_counter() - load_started,
+        "adaptation_time_ms": _distribution_summary(
+            torch.cat(timing_pieces["adaptation_time_ms"])
+        ),
+        "target_time_ms": _distribution_summary(
+            torch.cat(timing_pieces["target_time_ms"])
+        ),
+    }
+    return cached, timing
 
 
 def _validate_cached_samples(data: Dict[str, torch.Tensor]) -> Dict[str, float]:
@@ -295,6 +326,7 @@ def _train_condition(
     model = _build_model(args, device)
     criterion = BalancedBandTokenTrajectoryLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    started = time.perf_counter()
     history = [
         (
             0,
@@ -309,7 +341,6 @@ def _train_condition(
             ),
         )
     ]
-    started = time.perf_counter()
 
     for step, (indices, token_mask, target_map) in enumerate(
         zip(schedule, training_masks, training_target_maps), start=1
@@ -437,6 +468,7 @@ def run_short_overfit(data, args):
 
 
 def main():
+    program_started = time.perf_counter()
     args = parse_args()
     _reject_unready_dataset(args.dataset)
     if not os.path.exists(args.lance_path):
@@ -465,8 +497,9 @@ def main():
             flush=True,
         )
 
-    data = _load_real_samples(args)
+    data, data_timing = _load_real_samples(args)
     result = run_short_overfit(data, args)
+    total_wall_seconds = time.perf_counter() - program_started
     stats = result["data_stats"]
     aligned = result["aligned"]
     shuffled = result["shuffled"]
@@ -476,6 +509,26 @@ def main():
     print("samples:", args.samples, "steps_per_condition:", args.steps)
     print("device:", args.device, "tiny_model_only: YES")
     print("negative_control: per-step target derangement; evaluation target=aligned")
+    print(
+        "data_timing_seconds:",
+        f"index_scan={data_timing['index_scan_seconds']:.4f} "
+        f"materialize_runtime_samples={data_timing['materialization_seconds']:.4f} "
+        f"total_prepare={data_timing['total_data_prepare_seconds']:.4f}",
+    )
+    adaptation_timing = data_timing["adaptation_time_ms"]
+    target_timing = data_timing["target_time_ms"]
+    print(
+        "adaptation_cpu_ms_per_row:",
+        f"mean={adaptation_timing['mean']:.3f} p50={adaptation_timing['p50']:.3f} "
+        f"p95={adaptation_timing['p95']:.3f} max={adaptation_timing['max']:.3f} "
+        f"worker_cpu_sum={adaptation_timing['sum']:.3f}",
+    )
+    print(
+        "target_cpu_ms_per_row:",
+        f"mean={target_timing['mean']:.3f} p50={target_timing['p50']:.3f} "
+        f"p95={target_timing['p95']:.3f} max={target_timing['max']:.3f} "
+        f"worker_cpu_sum={target_timing['sum']:.3f}",
+    )
     print(
         "valid_tokens_per_sample:",
         f"min={stats['valid_tokens_min']} mean={stats['valid_tokens_mean']:.2f} "
@@ -500,6 +553,18 @@ def main():
         f"initial={shuffled['initial_loss']:.6f} final={shuffled['final_loss']:.6f} "
         f"drop={100.0 * shuffled['relative_drop']:.2f}%",
     )
+    print(
+        "condition_wall_seconds_including_fixed_eval:",
+        f"aligned={aligned['elapsed_seconds']:.4f} "
+        f"shuffled={shuffled['elapsed_seconds']:.4f} "
+        f"combined={aligned['elapsed_seconds'] + shuffled['elapsed_seconds']:.4f}",
+    )
+    print(
+        "condition_wall_ms_per_train_step_including_fixed_eval:",
+        f"aligned={1000.0 * aligned['elapsed_seconds'] / args.steps:.3f} "
+        f"shuffled={1000.0 * shuffled['elapsed_seconds'] / args.steps:.3f}",
+    )
+    print("total_program_wall_seconds:", f"{total_wall_seconds:.4f}")
     print("zero_predictor_loss:", f"{result['zero_baseline_loss']:.6f}")
     print(
         "aligned_advantage_over_zero_predictor:",

@@ -21,6 +21,9 @@ from torch.utils.data import Dataset
 
 from channel_config import STANDARD_64_CHANNELS
 from configs import Config
+from runtime_adaptation.contracts import CanonicalEEGWindow
+from runtime_adaptation.core import SharedFBMAECore
+from runtime_adaptation.inria import InriaDecoder
 
 
 INRIA_CHANNELS: Tuple[str, ...] = (
@@ -250,7 +253,10 @@ def compute_runtime_targets(
     return target4d.reshape(-1, len(cfg.band_defs), frames_per_patch), target4d
 
 
-def adapt_inria_row(row: Dict[str, Any], validate: bool = True) -> Dict[str, Any]:
+def _legacy_adapt_inria_row_reference(
+    row: Dict[str, Any],
+    validate: bool = True,
+) -> Dict[str, Any]:
     valid_samples = int(_as_python(row["valid_samples"]))
     if valid_samples != 1000:
         raise ValueError(f"Only valid_samples == 1000 is supported, got {valid_samples}")
@@ -361,6 +367,24 @@ def adapt_inria_row(row: Dict[str, Any], validate: bool = True) -> Dict[str, Any
         "subject": str(_as_python(row.get("subject", "")) or ""),
         "dataset_id": str(_as_python(row.get("dataset_id", "inria")) or "inria"),
     }
+
+
+_INRIA_DECODER = InriaDecoder()
+_SHARED_FBMAE_CORE = SharedFBMAECore()
+
+
+def adapt_inria_row(row: Dict[str, Any], validate: bool = True) -> Dict[str, Any]:
+    """Decode Inria source semantics, then run the shared FBMAE core."""
+    valid_samples = _normalize_valid_samples(row.get("valid_samples"))
+    if valid_samples != 1000:
+        raise ValueError(f"Only valid_samples == 1000 is supported, got {valid_samples}")
+
+    decode_started = time.perf_counter()
+    canonical_window = _INRIA_DECODER.decode(row)
+    decode_ms = (time.perf_counter() - decode_started) * 1000.0
+    sample = _SHARED_FBMAE_CORE.adapt(canonical_window, validate=validate)
+    sample["adaptation_time_ms"] += decode_ms
+    return sample
 
 
 class InriaRuntimeTargetDataset(Dataset):
