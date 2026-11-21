@@ -24,14 +24,14 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from inria_runtime_dataset import InriaRuntimeTargetDataset  # noqa: E402
+from canonical_runtime_dataset import CanonicalRuntimeTargetDataset  # noqa: E402
 from losses import BalancedBandTokenTrajectoryLoss  # noqa: E402
 from masking import apply_token_mask  # noqa: E402
 from model import EEGPretrainModel  # noqa: E402
 from trainer import build_batch_token_mask  # noqa: E402
 
 
-SUPPORTED_DATASET = "inria"
+SUPPORTED_DATASETS = ("inria", "egobrain", "shin2017a")
 TENSOR_FIELDS = (
     "token_inputs",
     "targets",
@@ -89,13 +89,7 @@ def _reject_unready_dataset(dataset_name: str):
             "ds004408 is intentionally blocked: its electrode coordinate/channel "
             "mapping is not established, so it must not enter a model test."
         )
-    if dataset_name in {"egobrain", "shin2017a"}:
-        raise RuntimeError(
-            f"{dataset_name} has no validated runtime channel/schema adapter in "
-            "this checkout. Complete layer-1 numerical validation before running "
-            "the short-overfit model test."
-        )
-    if dataset_name != SUPPORTED_DATASET:
+    if dataset_name not in SUPPORTED_DATASETS:
         raise RuntimeError(f"Unsupported dataset: {dataset_name}")
 
 
@@ -113,8 +107,9 @@ def _distribution_summary(values: torch.Tensor) -> Dict[str, float]:
 def _load_real_samples(args):
     load_started = time.perf_counter()
     index_scan_started = time.perf_counter()
-    dataset = InriaRuntimeTargetDataset(
+    dataset = CanonicalRuntimeTargetDataset(
         lance_path=args.lance_path,
+        dataset_key=args.dataset,
         max_samples=args.samples,
         validate=True,
     )
@@ -134,14 +129,24 @@ def _load_real_samples(args):
         )
 
     print("valid_samples_scan:", dataset.valid_samples_audit, flush=True)
+    print("channel_mapping_audit:", dataset.mapping_audit, flush=True)
     pieces = {field: [] for field in TENSOR_FIELDS}
     timing_pieces = {field: [] for field in ROW_TIMING_FIELDS}
+    observed_dropped_counts = []
+    observed_dropped_names = set()
+    observed_mapping_policies = set()
     materialization_started = time.perf_counter()
     for batch in DataLoader(**loader_kwargs):
         for field in TENSOR_FIELDS:
             pieces[field].append(batch[field].cpu())
         for field in ROW_TIMING_FIELDS:
             timing_pieces[field].append(batch[field].cpu().reshape(-1))
+        observed_dropped_counts.extend(
+            int(value) for value in batch["dropped_channel_count"].tolist()
+        )
+        for names in batch["dropped_channel_names"]:
+            observed_dropped_names.update(name for name in names.split(",") if name)
+        observed_mapping_policies.update(batch["channel_mapping_policy"])
     materialization_seconds = time.perf_counter() - materialization_started
     cached = {field: torch.cat(values, dim=0) for field, values in pieces.items()}
     if cached["token_inputs"].shape[0] != args.samples:
@@ -158,6 +163,12 @@ def _load_real_samples(args):
         "target_time_ms": _distribution_summary(
             torch.cat(timing_pieces["target_time_ms"])
         ),
+        "channel_mapping": {
+            "policies": sorted(observed_mapping_policies),
+            "dropped_channel_names": sorted(observed_dropped_names),
+            "dropped_count_min": min(observed_dropped_counts),
+            "dropped_count_max": max(observed_dropped_counts),
+        },
     }
     return cached, timing
 
@@ -509,6 +520,7 @@ def main():
     print("samples:", args.samples, "steps_per_condition:", args.steps)
     print("device:", args.device, "tiny_model_only: YES")
     print("negative_control: per-step target derangement; evaluation target=aligned")
+    print("observed_channel_mapping:", data_timing["channel_mapping"])
     print(
         "data_timing_seconds:",
         f"index_scan={data_timing['index_scan_seconds']:.4f} "

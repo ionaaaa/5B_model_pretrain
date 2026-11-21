@@ -53,8 +53,8 @@ def _make_cached_samples(sample_count=4):
 class TestRuntimeShortOverfit(unittest.TestCase):
     def test_dataset_gates(self):
         _reject_unready_dataset("inria")
-        with self.assertRaisesRegex(RuntimeError, "no validated runtime"):
-            _reject_unready_dataset("egobrain")
+        _reject_unready_dataset("egobrain")
+        _reject_unready_dataset("shin2017a")
         with self.assertRaisesRegex(RuntimeError, "electrode coordinate"):
             _reject_unready_dataset("ds004408")
 

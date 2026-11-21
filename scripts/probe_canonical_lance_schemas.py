@@ -22,6 +22,7 @@ from runtime_adaptation.inria import (  # noqa: E402
     INRIA_CHANNELS,
     normalize_integer_scalar,
 )
+from runtime_adaptation.canonical import parse_canonical_schema_metadata  # noqa: E402
 
 
 DEFAULT_DATASETS = ("inria", "egobrain", "shin2017a")
@@ -289,8 +290,22 @@ def probe_dataset(key: str, path: str, head_rows: int, max_scan_rows: int, batch
             )
 
     direct_sfreq = semantics["sfreq_counts"]
-    registry_sfreq_hint = 100.0 if key == "inria" else None
     direct_catalog = semantics["observed_channel_names"]
+    metadata_sfreq = None
+    metadata_catalogs = []
+    try:
+        canonical_metadata = parse_canonical_schema_metadata(schema)
+        metadata_sfreq = float(canonical_metadata["recipe"]["sampling_rates"]["eeg"])
+        metadata_catalogs = [
+            {
+                "channel_map_id": str(entry["channel_map_id"]),
+                "channel_names": list(entry["channel_names"]),
+            }
+            for entry in canonical_metadata["channel_metadata_catalog"]["eeg"]
+        ]
+    except (KeyError, TypeError, ValueError):
+        pass
+    registry_sfreq_hint = 100.0 if key == "inria" else None
     registry_catalog_hint = list(INRIA_CHANNELS) if key == "inria" else None
     return {
         "key": key,
@@ -305,14 +320,16 @@ def probe_dataset(key: str, path: str, head_rows: int, max_scan_rows: int, batch
         "semantics": semantics,
         "sampling_rate_evidence": {
             "physical_field_values": direct_sfreq,
+            "schema_metadata_value": metadata_sfreq,
             "registry_hint": registry_sfreq_hint,
-            "established_from_lance": bool(direct_sfreq),
+            "established_from_lance": bool(direct_sfreq) or metadata_sfreq is not None,
         },
         "channel_catalog_evidence": {
             "physical_channel_names": direct_catalog,
+            "schema_metadata_catalogs": metadata_catalogs,
             "observed_channel_indices": semantics["observed_channel_indices"],
             "registry_hint": registry_catalog_hint,
-            "established_from_lance": bool(direct_catalog),
+            "established_from_lance": bool(direct_catalog) or bool(metadata_catalogs),
         },
     }
 

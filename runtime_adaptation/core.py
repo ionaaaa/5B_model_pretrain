@@ -12,6 +12,7 @@ from scipy.signal import spectrogram
 
 from channel_config import CHANNEL_ALIASES, STANDARD_64_CHANNELS
 from configs import Config
+from runtime_adaptation.channel_mapping import resolve_channel_mapping_policy
 from runtime_adaptation.contracts import CanonicalEEGWindow
 
 
@@ -32,19 +33,25 @@ def canonicalize_channel_name(name: str) -> str:
 def align_window_to_standard64(
     window: CanonicalEEGWindow,
     standard_channels: Sequence[str] = STANDARD_64_CHANNELS,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, Tuple[str, ...], str]:
     """Map one canonical source window to fixed standard-channel slots."""
+    policy = resolve_channel_mapping_policy(window)
     standard_index = {name: index for index, name in enumerate(standard_channels)}
     signal = np.zeros((len(standard_channels), window.waveform.shape[1]), dtype=np.float32)
     channel_valid = np.zeros(len(standard_channels), dtype=np.float32)
     occupied = set()
+    dropped = []
 
     for source_index, source_name in enumerate(window.channel_names):
         name = canonicalize_channel_name(source_name)
         if name not in standard_index:
+            if source_name in policy.allowed_dropped_channels:
+                dropped.append(source_name)
+                continue
             raise ValueError(
                 f"{window.dataset_key} channel {source_name!r} canonicalized to "
-                f"{name!r}, which is absent from STANDARD_64_CHANNELS"
+                f"{name!r}, which is absent from STANDARD_64_CHANNELS and is not "
+                f"allowed by mapping policy {policy.name!r}"
             )
         destination = standard_index[name]
         if destination in occupied:
@@ -56,7 +63,7 @@ def align_window_to_standard64(
             signal[destination] = window.waveform[source_index]
             channel_valid[destination] = 1.0
 
-    return signal, channel_valid
+    return signal, channel_valid, tuple(dropped), policy.name
 
 
 def compute_runtime_targets(
@@ -161,7 +168,12 @@ class SharedFBMAECore:
             )
 
         adaptation_started = time.perf_counter()
-        signal64, channel_valid_mask = align_window_to_standard64(window)
+        (
+            signal64,
+            channel_valid_mask,
+            dropped_channel_names,
+            channel_mapping_policy,
+        ) = align_window_to_standard64(window)
         patch_len = int(round(self.cfg.patch_seconds * self.cfg.target_sfreq))
         patch_stride = int(round(self.cfg.patch_stride_seconds * self.cfg.target_sfreq))
         n_patches = 1 + (signal64.shape[1] - patch_len) // patch_stride
@@ -220,6 +232,10 @@ class SharedFBMAECore:
             "adaptation_time_ms": adaptation_ms,
             "target_time_ms": target_ms,
             "valid_channel_count": int(channel_valid_mask.sum()),
+            "source_channel_count": len(window.channel_names),
+            "dropped_channel_count": len(dropped_channel_names),
+            "dropped_channel_names": ",".join(dropped_channel_names),
+            "channel_mapping_policy": channel_mapping_policy,
             "waveform_mean_abs_max": waveform_mean_abs_max,
             "waveform_std_error_max": waveform_std_error_max,
             "source_index": window.source_index,
