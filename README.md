@@ -217,6 +217,38 @@ channel-major ordering, zero-filled invalid channels, nonconstant targets, and
 token/target flatten alignment. It also reports adaptation, target-computation,
 and end-to-end DataLoader timing.
 
+### Inria short-overfit diagnostic
+
+After the runtime-adapter and one-step tiny-model checks pass, repeat a small
+real sample set through two identical tiny-model runs. The first uses aligned
+targets; the second uses a fixed cross-sample target derangement. Both runs use
+the same initialization, batch schedule, token masks, and optimizer settings.
+
+```bash
+python scripts/validate_runtime_short_overfit.py \
+  --dataset inria \
+  --lance-path "${COS_MOUNT_ROOT}/datasets/inria/releases/pretrain_V1/data.lance" \
+  --samples 32 \
+  --steps 60 \
+  --batch-size 8 \
+  --num-workers 4 \
+  --prefetch-factor 2 \
+  --d-model 64 \
+  --n-heads 4 \
+  --depth 2 \
+  --mask-ratio 0.8 \
+  --learning-rate 1e-3 \
+  --eval-every 10 \
+  --device cpu
+```
+
+The command fails if aligned fixed-mask evaluation loss does not drop by at
+least 10%, or if its final loss is not lower than the shuffled-target control.
+It also fails immediately on non-finite tensors, losses, gradients, or model
+parameters. `egobrain` and `shin2017a` remain blocked until their layer-1
+runtime adapters are validated. `ds004408` is explicitly blocked until its
+electrode coordinate/channel mapping is established.
+
 ---
 
 ### 总结
