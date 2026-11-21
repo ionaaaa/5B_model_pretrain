@@ -221,8 +221,10 @@ and end-to-end DataLoader timing.
 
 After the runtime-adapter and one-step tiny-model checks pass, repeat a small
 real sample set through two identical tiny-model runs. The first uses aligned
-targets; the second uses a fixed cross-sample target derangement. Both runs use
-the same initialization, batch schedule, token masks, and optimizer settings.
+targets; the second uses a different deterministic cross-sample target
+derangement at every step, preventing memorization of one fixed wrong mapping.
+Both models are evaluated against the true aligned targets and use the same
+initialization, batch schedule, token masks, and optimizer settings.
 
 ```bash
 python scripts/validate_runtime_short_overfit.py \

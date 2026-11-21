@@ -3,8 +3,9 @@
 
 The script intentionally trains only a tiny ``EEGPretrainModel`` on 16--64
 real samples.  It compares the correctly aligned targets with a deterministic
-cross-sample target shuffle under identical initialization, batches, masks,
-and optimizer settings.  It never constructs the 5B model and never writes a
+per-step cross-sample target derangement under identical initialization,
+batches, masks, and optimizer settings.  Both models are evaluated against the
+true aligned targets.  It never constructs the 5B model and never writes a
 processed Lance dataset.
 """
 
@@ -282,7 +283,8 @@ def _evaluate(
 def _train_condition(
     name,
     data,
-    target_map,
+    training_target_maps,
+    evaluation_target_map,
     schedule,
     training_masks,
     eval_batches,
@@ -294,11 +296,24 @@ def _train_condition(
     criterion = BalancedBandTokenTrajectoryLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     history = [
-        (0, _evaluate(model, criterion, data, target_map, eval_batches, eval_masks, device))
+        (
+            0,
+            _evaluate(
+                model,
+                criterion,
+                data,
+                evaluation_target_map,
+                eval_batches,
+                eval_masks,
+                device,
+            ),
+        )
     ]
     started = time.perf_counter()
 
-    for step, (indices, token_mask) in enumerate(zip(schedule, training_masks), start=1):
+    for step, (indices, token_mask, target_map) in enumerate(
+        zip(schedule, training_masks, training_target_maps), start=1
+    ):
         mapped = target_map[indices]
         inputs = data["token_inputs"][indices].to(device)
         targets = data["targets"][mapped].to(device)
@@ -328,7 +343,13 @@ def _train_condition(
 
         if step % args.eval_every == 0 or step == args.steps:
             eval_loss = _evaluate(
-                model, criterion, data, target_map, eval_batches, eval_masks, device
+                model,
+                criterion,
+                data,
+                evaluation_target_map,
+                eval_batches,
+                eval_masks,
+                device,
             )
             history.append((step, eval_loss))
             print(
@@ -364,16 +385,24 @@ def run_short_overfit(data, args):
         sample_count, args.batch_size, args.mask_ratio, args.seed + 3
     )
     aligned_map = torch.arange(sample_count, dtype=torch.long)
-    shuffled_map = torch.roll(aligned_map, shifts=1)
-    if sample_count > 1 and torch.any(shuffled_map == aligned_map):
-        raise AssertionError("shuffled target map is not a derangement")
+    aligned_training_maps = [aligned_map] * args.steps
+    shuffle_rng = np.random.default_rng(args.seed + 4)
+    shuffled_training_maps = [
+        torch.roll(
+            aligned_map,
+            shifts=int(shuffle_rng.integers(1, sample_count)),
+        )
+        for _ in range(args.steps)
+    ]
+    if any(torch.any(target_map == aligned_map) for target_map in shuffled_training_maps):
+        raise AssertionError("a shuffled training target map is not a derangement")
 
     aligned = _train_condition(
-        "aligned", data, aligned_map, schedule, training_masks,
+        "aligned", data, aligned_training_maps, aligned_map, schedule, training_masks,
         eval_batches, eval_masks, args, device,
     )
     shuffled = _train_condition(
-        "shuffled", data, shuffled_map, schedule, training_masks,
+        "shuffled", data, shuffled_training_maps, aligned_map, schedule, training_masks,
         eval_batches, eval_masks, args, device,
     )
     criterion = BalancedBandTokenTrajectoryLoss()
@@ -446,6 +475,7 @@ def main():
     print("dataset:", args.dataset)
     print("samples:", args.samples, "steps_per_condition:", args.steps)
     print("device:", args.device, "tiny_model_only: YES")
+    print("negative_control: per-step target derangement; evaluation target=aligned")
     print(
         "valid_tokens_per_sample:",
         f"min={stats['valid_tokens_min']} mean={stats['valid_tokens_mean']:.2f} "
