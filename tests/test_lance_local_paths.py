@@ -102,6 +102,35 @@ class TestMountedLancePaths(unittest.TestCase):
         load_options.assert_not_called()
         self.assertIsNone(multi_dataset.call_args.kwargs["storage_options"])
 
+    def test_training_entry_builds_runtime_dataset_from_mounted_lance(self):
+        from largeScale_pretrain_main import build_dataset
+
+        cfg = Config()
+        cfg.data.input_mode = "canonical_runtime"
+        cfg.data.canonical_dataset_key = "egobrain"
+        cfg.data.canonical_lance_path = "/opt/ml/omni/egobrain/data.lance"
+        cfg.data.runtime_max_samples = 128
+        fake_dataset = Mock()
+        fake_dataset.valid_samples_audit = {"selected_rows": 128}
+        fake_dataset.mapping_audit = {"policy_names": ["egobrain-drop-4-unmatched"]}
+
+        with patch("largeScale_pretrain_main.os.path.exists", return_value=True):
+            with patch("largeScale_pretrain_main.load_storage_options") as load_options:
+                with patch(
+                    "largeScale_pretrain_main.CanonicalRuntimeTargetDataset",
+                    return_value=fake_dataset,
+                ) as runtime_dataset:
+                    result = build_dataset(cfg, rank=1)
+
+        self.assertIs(result, fake_dataset)
+        load_options.assert_not_called()
+        runtime_dataset.assert_called_once_with(
+            lance_path="/opt/ml/omni/egobrain/data.lance",
+            dataset_key="egobrain",
+            max_samples=128,
+            validate=True,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,10 +6,12 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from largeScale_pretrain_main import (
+    apply_cli_config,
     maybe_wrap_prefetch_loaders,
     parse_args,
     resolve_use_prefetch_loader,
 )
+from configs import Config
 from prefetch_loader import PrefetchLoader
 
 
@@ -59,6 +61,42 @@ class PrefetchLoaderCLITests(unittest.TestCase):
             self.assertTrue(parse_args().use_prefetch_loader)
         self.assertFalse(resolve_use_prefetch_loader(False, True))
         self.assertTrue(resolve_use_prefetch_loader(True, False))
+
+    def test_formal_runtime_cli_applies_profile_then_run_overrides(self):
+        argv = [
+            "largeScale_pretrain_main.py",
+            "--model-profile", "5b",
+            "--data-mode", "canonical_runtime",
+            "--dataset-key", "egobrain",
+            "--lance-path", "/opt/ml/omni/datasets/egobrain/data.lance",
+            "--max-samples", "128",
+            "--batch-size", "4",
+            "--num-workers", "2",
+            "--num-epochs", "1",
+            "--learning-rate", "0.0002",
+            "--output-root", "/mnt/cfs/output/runtime_trial",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg = apply_cli_config(Config(), parse_args())
+
+        self.assertEqual(cfg.model.profile, "5b")
+        self.assertEqual(cfg.model.d_model, 4096)
+        self.assertEqual(cfg.model.n_heads, 16)
+        self.assertEqual(cfg.model.depth, 25)
+        self.assertEqual(cfg.mask.mask_ratios, [0.9])
+        self.assertEqual(cfg.mask.mask_ratio_weights, [1.0])
+        self.assertEqual(cfg.data.input_mode, "canonical_runtime")
+        self.assertEqual(cfg.data.canonical_dataset_key, "egobrain")
+        self.assertEqual(
+            cfg.data.canonical_lance_path,
+            "/opt/ml/omni/datasets/egobrain/data.lance",
+        )
+        self.assertEqual(cfg.data.runtime_max_samples, 128)
+        self.assertEqual(cfg.train.batch_size, 4)
+        self.assertEqual(cfg.train.num_workers, 2)
+        self.assertEqual(cfg.train.num_epochs, 1)
+        self.assertEqual(cfg.train.lr, 0.0002)
+        self.assertEqual(cfg.train.output_root, "/mnt/cfs/output/runtime_trial")
 
 
 if __name__ == "__main__":

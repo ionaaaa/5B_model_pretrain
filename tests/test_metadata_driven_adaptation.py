@@ -145,9 +145,11 @@ class TestMetadataDrivenAdaptation(unittest.TestCase):
                 path, dataset_key="egobrain", max_samples=1, validate=True
             )
             sample = dataset[0]
+            located = dataset._locate(0)
         self.assertEqual(dataset.mapping_audit["canonical_sfreq"], 100.0)
         self.assertEqual(sample["valid_channel_count"], 28)
         self.assertEqual(sample["dropped_channel_count"], 4)
+        self.assertEqual(located, (0, 0))
 
 
 if __name__ == "__main__":

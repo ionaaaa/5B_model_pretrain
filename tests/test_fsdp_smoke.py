@@ -8,7 +8,7 @@ from unittest.mock import patch
 import torch
 import torch.nn as nn
 
-from configs import Config
+from configs import Config, apply_pretrain_profile
 from fsdp_utils import (
     fsdp_auto_wrap_policy,
     fsdp_mixed_precision_policy,
@@ -70,8 +70,14 @@ def run_tiny_step(model, optimizer, batch):
 
 
 class TestFSDPSmoke(unittest.TestCase):
-    def test_formal_config_without_constructing_the_five_billion_model(self):
+    def test_formal_default_is_50m_without_constructing_a_large_model(self):
         cfg = Config()
+        self.assertEqual((cfg.model.d_model, cfg.model.n_heads), (512, 8))
+        self.assertEqual((cfg.model.depth, cfg.model.mlp_ratio), (12, 4.0))
+        self.assertEqual(cfg.model.d_model // cfg.model.n_heads, 64)
+
+    def test_five_billion_profile_remains_selectable_without_constructing_it(self):
+        cfg = apply_pretrain_profile(Config(), "5b")
         self.assertEqual((cfg.model.d_model, cfg.model.n_heads), (4096, 16))
         self.assertEqual((cfg.model.depth, cfg.model.mlp_ratio), (25, 4.0))
         self.assertEqual(cfg.model.d_model // cfg.model.n_heads, 256)

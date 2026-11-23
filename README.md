@@ -217,9 +217,12 @@ Runtime adaptation is split into two explicit layers:
 dataset row -> dataset decoder -> CanonicalEEGWindow -> SharedFBMAECore
 ```
 
-`InriaDecoder` owns Inria field/catalog semantics. `SharedFBMAECore` owns the
-standard-64 mapping, channel-major patches, runtime targets, indices, and
-masks. Existing `adapt_inria_row` callers remain compatible.
+`MetadataDrivenCanonicalDecoder` reads the dataset identity and ordered channel
+catalog from Lance schema metadata. `SharedFBMAECore` owns the standard-64
+mapping, channel-major patches, runtime targets, indices, and masks. The
+registered Inria, Egobrain, and Shin2017a policies make every dropped channel
+explicit; Shin2017a remains a direct-name validation mode with only 12 matched
+channels.
 
 `inria_runtime_dataset.py` reads the Inria `pretrain_V1` canonical Lance release
 and constructs FBMAE tokens and time-frequency targets inside DataLoader workers.
@@ -285,9 +288,43 @@ least 10%, beats a zero predictor by at least 10%, and beats the shuffled-target
 control by at least 5%. A separate run with `--mask-ratio 0.8` is useful as a
 numerical stability check, but is not accepted as evidence of target alignment.
 The script also fails immediately on non-finite tensors, losses, gradients, or
-model parameters. `egobrain` and `shin2017a` remain blocked until their layer-1
-runtime adapters are validated. `ds004408` is explicitly blocked until its
-electrode coordinate/channel mapping is established.
+model parameters. Inria, Egobrain, and the 12-channel direct-name Shin2017a
+validation mode have passed this diagnostic. `ds004408` is explicitly blocked
+until its electrode coordinate/channel mapping is established.
+
+### Formal single-dataset runtime pretraining trial
+
+The formal entry supports either historical processed Lance rows or mounted
+canonical EEG adapted in DataLoader workers. The default profile is the 50M
+trial shape (`d_model=512`, `n_heads=8`, `depth=12`); the historical 5B shape is
+retained behind `--model-profile 5b`. Both use the requested fixed mask ratio
+of 0.9. Runtime targets are computed from the unmasked waveform before the
+trainer applies its random token mask, and no processed Lance is written.
+
+Start with one GPU and a bounded Egobrain run:
+
+```bash
+export COS_MOUNT_ROOT=/opt/ml/omni-eeg-processed
+cd /mnt/cfs/jianyu/5B_model_pretrain
+
+python largeScale_pretrain_main.py \
+  --model-profile 50m \
+  --data-mode canonical_runtime \
+  --dataset-key egobrain \
+  --lance-path "${COS_MOUNT_ROOT}/datasets/egobrain/releases/pretrain_V1/data.lance" \
+  --max-samples 512 \
+  --batch-size 4 \
+  --num-workers 4 \
+  --num-epochs 1 \
+  --output-root /mnt/cfs/jianyu/5B_model_pretrain/output/runtime_50m_egobrain \
+  --no-prefetch-loader \
+  --step-debug-last-n 3
+```
+
+The batch-size override is intentionally conservative for the first real run;
+it does not change the selected 50M model profile. Remove `--max-samples` only
+after the bounded trial completes. Do not select the 5B profile for this smoke
+run.
 
 ---
 

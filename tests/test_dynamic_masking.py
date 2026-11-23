@@ -1,24 +1,33 @@
 import unittest
-from collections import Counter
 from unittest.mock import patch
 
 import torch
 import torch.nn as nn
 
-from configs import Config, MaskConfig
+from configs import Config, MaskConfig, apply_pretrain_profile
 from losses import BalancedBandTokenTrajectoryLoss
 from masking import expected_mask_ratio, sample_mask_ratio, validate_mask_config
 import trainer
 
 
 class TestModelScale(unittest.TestCase):
-    def test_default_config_is_the_formal_five_billion_shape(self):
+    def test_default_config_is_the_50m_trial_shape(self):
         cfg = Config()
+        self.assertEqual(cfg.model.profile, "50m")
+        self.assertEqual(cfg.model.d_model, 512)
+        self.assertEqual(cfg.model.n_heads, 8)
+        self.assertEqual(cfg.model.depth, 12)
+        self.assertEqual(cfg.model.mlp_ratio, 4.0)
+        self.assertEqual(cfg.model.d_model // cfg.model.n_heads, 64)
+
+    def test_five_billion_profile_is_retained(self):
+        cfg = apply_pretrain_profile(Config(), "5b")
+        self.assertEqual(cfg.model.profile, "5b")
         self.assertEqual(cfg.model.d_model, 4096)
         self.assertEqual(cfg.model.n_heads, 16)
         self.assertEqual(cfg.model.depth, 25)
-        self.assertEqual(cfg.model.mlp_ratio, 4.0)
-        self.assertEqual(cfg.model.d_model // cfg.model.n_heads, 256)
+        self.assertEqual(cfg.train.batch_size, 32)
+        self.assertEqual(cfg.train.lr, 5e-5)
 
 
 class TestDynamicMasking(unittest.TestCase):
@@ -26,17 +35,11 @@ class TestDynamicMasking(unittest.TestCase):
         cfg = MaskConfig()
         torch.manual_seed(7)
         samples = [sample_mask_ratio(cfg) for _ in range(1000)]
-        self.assertTrue(set(samples).issubset({0.6, 0.7, 0.8, 0.9}))
+        self.assertEqual(set(samples), {0.9})
 
-    def test_sampler_follows_weight_order_and_expected_ratio(self):
+    def test_default_expected_ratio_is_fixed_at_point_nine(self):
         cfg = MaskConfig()
-        torch.manual_seed(17)
-        counts = Counter(sample_mask_ratio(cfg) for _ in range(20000))
-
-        self.assertGreater(counts[0.9], counts[0.8])
-        self.assertGreater(counts[0.8], counts[0.7])
-        self.assertGreater(counts[0.7], counts[0.6])
-        self.assertAlmostEqual(expected_mask_ratio(cfg), 0.8)
+        self.assertAlmostEqual(expected_mask_ratio(cfg), 0.9)
 
     def test_invalid_mask_configs_raise_clear_errors(self):
         with self.assertRaisesRegex(ValueError, "same length"):

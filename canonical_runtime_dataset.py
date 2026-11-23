@@ -127,6 +127,11 @@ class CanonicalRuntimeTargetDataset(Dataset):
     def __len__(self) -> int:
         return len(self.source_indices)
 
+    def _locate(self, index: int):
+        """Expose one-part locality to the formal PartAware batch sampler."""
+        source_index = self.source_indices[int(index)]
+        return 0, int(source_index)
+
     def __getstate__(self):
         state = self.__dict__.copy()
         state["ds"] = None

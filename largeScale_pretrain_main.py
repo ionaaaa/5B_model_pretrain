@@ -9,10 +9,11 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-from configs import Config
+from configs import Config, PRETRAIN_PROFILES, apply_pretrain_profile
 from channel_config import STANDARD_64_CHANNELS
 
 from dataset import collate_fn
+from canonical_runtime_dataset import CanonicalRuntimeTargetDataset
 from lance_dataset import LanceEEGPretrainDataset
 from prefetch_loader import PrefetchLoader
 
@@ -96,6 +97,41 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_rank", "--local-rank", type=int, default=None)
     parser.add_argument(
+        "--model-profile",
+        choices=tuple(PRETRAIN_PROFILES),
+        default=None,
+        help="Model/training scale profile. Defaults to the config profile (50m).",
+    )
+    parser.add_argument(
+        "--data-mode",
+        choices=("processed_lance", "canonical_runtime"),
+        default=None,
+        help="Read historical processed tokens or adapt canonical EEG at runtime.",
+    )
+    parser.add_argument(
+        "--dataset-key",
+        type=str,
+        default=None,
+        help="Canonical dataset identity, e.g. inria, egobrain, or shin2017a.",
+    )
+    parser.add_argument(
+        "--lance-path",
+        type=str,
+        default=None,
+        help="Mounted single Lance path used by canonical_runtime mode.",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Optional number of full canonical rows for a bounded trial run.",
+    )
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--num-epochs", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--output-root", type=str, default=None)
+    parser.add_argument(
         "--resume",
         type=str,
         default=None,
@@ -123,6 +159,42 @@ def parse_args():
     parser.set_defaults(use_prefetch_loader=None)
     args, _ = parser.parse_known_args()
     return args
+
+
+def apply_cli_config(cfg, args):
+    """Apply a named profile first, then explicit trial/run overrides."""
+    profile_name = args.model_profile or cfg.model.profile
+    apply_pretrain_profile(cfg, profile_name)
+
+    if args.data_mode is not None:
+        cfg.data.input_mode = args.data_mode
+    if args.dataset_key is not None:
+        cfg.data.canonical_dataset_key = args.dataset_key
+    if args.lance_path is not None:
+        cfg.data.canonical_lance_path = args.lance_path
+    if args.max_samples is not None:
+        if args.max_samples < 2:
+            raise ValueError("--max-samples must be at least 2 for train/val split")
+        cfg.data.runtime_max_samples = args.max_samples
+    if args.batch_size is not None:
+        if args.batch_size <= 0:
+            raise ValueError("--batch-size must be positive")
+        cfg.train.batch_size = args.batch_size
+    if args.num_workers is not None:
+        if args.num_workers < 0:
+            raise ValueError("--num-workers must be non-negative")
+        cfg.train.num_workers = args.num_workers
+    if args.num_epochs is not None:
+        if args.num_epochs <= 0:
+            raise ValueError("--num-epochs must be positive")
+        cfg.train.num_epochs = args.num_epochs
+    if args.learning_rate is not None:
+        if args.learning_rate <= 0:
+            raise ValueError("--learning-rate must be positive")
+        cfg.train.lr = args.learning_rate
+    if args.output_root is not None:
+        cfg.train.output_root = args.output_root
+    return cfg
 
 
 def setup_distributed(local_rank_arg=None):
@@ -394,6 +466,35 @@ def visualize_train_reconstruction(
 
 
 def build_dataset(cfg, rank):
+    input_mode = getattr(cfg.data, "input_mode", "processed_lance")
+    if input_mode == "canonical_runtime":
+        lance_path = str(cfg.data.canonical_lance_path)
+        dataset_key = str(cfg.data.canonical_dataset_key)
+        if not lance_path:
+            raise ValueError(
+                "canonical_runtime requires --lance-path or "
+                "cfg.data.canonical_lance_path"
+            )
+        if not os.path.exists(lance_path):
+            raise FileNotFoundError(
+                f"Mounted canonical Lance path does not exist: {lance_path}"
+            )
+        dataset = CanonicalRuntimeTargetDataset(
+            lance_path=lance_path,
+            dataset_key=dataset_key,
+            max_samples=cfg.data.runtime_max_samples,
+            validate=True,
+        )
+        rank0_print(rank, "[CanonicalRuntime] dataset_key:", dataset_key)
+        rank0_print(rank, "[CanonicalRuntime] lance_path:", lance_path)
+        rank0_print(rank, "[CanonicalRuntime] valid_samples_scan:", dataset.valid_samples_audit)
+        rank0_print(rank, "[CanonicalRuntime] channel_mapping_audit:", dataset.mapping_audit)
+        rank0_print(rank, "[CanonicalRuntime] targets: generated in DataLoader workers")
+        return dataset
+
+    if input_mode != "processed_lance":
+        raise ValueError(f"Unsupported data input_mode={input_mode!r}")
+
     if cfg.data.use_multi_lance_parts:
         part_paths = load_lance_part_paths(cfg.data.lance_part_list_file)
         if len(part_paths) == 0:
@@ -468,7 +569,7 @@ def main():
     configure_nccl_flight_recorder_defaults()
     distributed, rank, world_size, local_rank, device = setup_distributed(args.local_rank)
 
-    cfg = Config()
+    cfg = apply_cli_config(Config(), args)
     if args.step_debug_last_n is not None:
         if args.step_debug_last_n < 0:
             raise ValueError("--step-debug-last-n must be greater than or equal to 0")
@@ -483,6 +584,8 @@ def main():
     enable_cuda_attention_kernels(rank)
 
     rank0_print(rank, "Using device:", device)
+    rank0_print(rank, "Model profile:", cfg.model.profile)
+    rank0_print(rank, "Data input mode:", cfg.data.input_mode)
     rank0_print(rank, "Run output dir:", run_dir)
     rank0_print(rank, "Checkpoint path template:", cfg.train.save_path)
     rank0_print(rank, "Visualization dir:", cfg.train.vis_dir)
@@ -505,7 +608,7 @@ def main():
     for k, v in shape_params.items():
         rank0_print(rank, f"{k}: {v}")
 
-    rank0_print(rank, "\n===== Loading Processed EEG Samples From Lance =====")
+    rank0_print(rank, "\n===== Loading EEG Samples From Lance =====")
     dataset = build_dataset(cfg, rank)
 
     rank0_print(rank, "dataset size:", len(dataset))
@@ -527,6 +630,9 @@ def main():
         print("  token_valid_mask:      ", tuple(s0["token_valid_mask"].shape))
         print("  channel_valid_mask:    ", tuple(s0["channel_valid_mask"].shape))
         print("  valid channels:        ", int(s0["channel_valid_mask"].sum().item()), "/ 64")
+        if "channel_mapping_policy" in s0:
+            print("  mapping policy:        ", s0["channel_mapping_policy"])
+            print("  dropped channels:      ", s0["dropped_channel_names"] or "NONE")
 
     n_total = len(dataset)
     n_train = max(1, int(n_total * 0.8))
