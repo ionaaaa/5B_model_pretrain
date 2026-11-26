@@ -1,0 +1,15 @@
+{
+  "datasets": [
+    {
+      "dataset_key": "ds002722",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds002722/releases/pretrain_V2/v022/data.lance",
+      "enabled": true
+    },
+    {
+      "dataset_key": "ds002723",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds002723/releases/pretrain_V2/v001/data.lance",
+      "catalog_path": "${COS_MOUNT_ROOT}/datasets/ds002723/releases/complete-recordings-eeg-native/v001/preflight.json",
+      "enabled": true
+    }
+  ]
+}

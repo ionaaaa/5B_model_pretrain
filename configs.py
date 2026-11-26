@@ -53,8 +53,8 @@ class MaskConfig:
     """
     mask 相关配置。
     """
-    # Formal single-dataset runtime pretraining uses a fixed 90% mask ratio.
-    mask_ratios: list[float] = field(default_factory=lambda: [0.9])
+    # Formal single-dataset runtime pretraining uses a fixed 80% mask ratio.
+    mask_ratios: list[float] = field(default_factory=lambda: [0.8])
     mask_ratio_weights: list[float] = field(default_factory=lambda: [1.0])
     min_block_tokens: int = 4
     max_block_tokens: int = 32
