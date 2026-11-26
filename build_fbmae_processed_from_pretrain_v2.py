@@ -149,6 +149,15 @@ class ConversionStats:
     processing_seconds: float = 0.0
 
 
+@dataclass
+class RowSelection:
+    """Source-row eligibility decided before an output writer is opened."""
+
+    source_rows_scanned: int = 0
+    eligible_source_indices: List[int] = field(default_factory=list)
+    skipped_too_short_rows: List[Dict[str, Any]] = field(default_factory=list)
+
+
 def _decode_metadata(schema: pa.Schema) -> Dict[str, Any]:
     decoded: Dict[str, Any] = {}
     for raw_key, raw_value in (schema.metadata or {}).items():
@@ -302,10 +311,16 @@ def align_to_standard_channels(
     return aligned, valid.astype(np.float32), dropped, duplicates
 
 
+def valid_samples_at_target_rate(source_samples: int, source_sfreq: float) -> int:
+    if source_sfreq <= 0:
+        raise ValueError(f"invalid sample rate {source_sfreq}")
+    return int(round(int(source_samples) * TARGET_SFREQ / source_sfreq))
+
+
 def resample_valid_signal(signal: np.ndarray, source_sfreq: float) -> Tuple[np.ndarray, int]:
     if source_sfreq <= 0:
         raise ValueError(f"invalid sample rate {source_sfreq}")
-    expected = int(round(signal.shape[1] * TARGET_SFREQ / source_sfreq))
+    expected = valid_samples_at_target_rate(signal.shape[1], source_sfreq)
     source_i = int(round(source_sfreq))
     target_i = int(round(TARGET_SFREQ))
     if not math.isclose(source_sfreq, source_i, abs_tol=1e-6):
@@ -409,6 +424,7 @@ def convert_row(
     overrides: Mapping[str, str],
     stats: ConversionStats,
     allow_unmapped_channels: bool = True,
+    source_row_idx: Optional[int] = None,
 ) -> Dict[str, Any]:
     started = time.perf_counter()
     raw_eeg = row.get("eeg")
@@ -498,7 +514,10 @@ def convert_row(
         "token_time_indices": token_time_indices.tolist(),
         "token_valid_mask": token_valid_mask.astype(np.float64).tolist(),
         "channel_valid_mask": channel_valid_mask.astype(np.float64).tolist(),
-        "sample_id": int(global_idx),
+        # global_idx is dense in the processed output.  sample_id deliberately
+        # preserves the source Lance row index when unusably short rows are
+        # skipped, without changing the historical physical schema.
+        "sample_id": int(global_idx if source_row_idx is None else source_row_idx),
         "global_idx": int(global_idx),
         "subject_id": _subject_from_recording_id(recording_id),
         "edf_relpath": recording_id,
@@ -752,6 +771,119 @@ def input_columns(schema: pa.Schema) -> List[str]:
     return [name for name in schema.names if name in required | optional]
 
 
+def select_trainable_rows(
+    dataset: lance.LanceDataset,
+    source_row_limit: int,
+    batch_size: int,
+) -> RowSelection:
+    """Find rows that produce at least one real sample at 100 Hz.
+
+    This metadata-only pass is required before writer construction so part
+    boundaries, expected row counts, and dataset-level completion checks use
+    the dense processed-row count rather than the source-row count.
+    """
+
+    result = RowSelection()
+    columns = [
+        name
+        for name in ("recording_id", "valid_samples", "sample_rate_hz")
+        if name in dataset.schema.names
+    ]
+    required = {"recording_id", "valid_samples", "sample_rate_hz"}
+    missing = required - set(columns)
+    if missing:
+        raise ValueError(f"input Lance is missing row-selection columns: {sorted(missing)}")
+
+    source_row_idx = 0
+    scanner = dataset.scanner(columns=columns, batch_size=batch_size)
+    for batch in scanner.to_batches():
+        for row in batch.to_pylist():
+            if source_row_idx >= source_row_limit:
+                break
+            valid_samples = int(row["valid_samples"])
+            source_sfreq = float(row["sample_rate_hz"])
+            valid_at_100hz = valid_samples_at_target_rate(valid_samples, source_sfreq)
+            if valid_at_100hz <= 0:
+                result.skipped_too_short_rows.append(
+                    {
+                        "source_row_idx": int(source_row_idx),
+                        "recording_id": str(row.get("recording_id", "")),
+                        "valid_samples": int(valid_samples),
+                        "sample_rate_hz": float(source_sfreq),
+                        "valid_samples_at_100hz": int(valid_at_100hz),
+                    }
+                )
+            else:
+                result.eligible_source_indices.append(source_row_idx)
+            source_row_idx += 1
+        if source_row_idx >= source_row_limit:
+            break
+
+    result.source_rows_scanned = source_row_idx
+    if source_row_idx != source_row_limit:
+        raise AssertionError(
+            f"row-selection scan stopped at {source_row_idx}, expected {source_row_limit}"
+        )
+    return result
+
+
+def inspect_existing_output(
+    output_dir: Path,
+    layout: str,
+    expected_rows: int,
+    rows_per_part: int,
+) -> Dict[str, Any]:
+    """Return a read-only dataset-level completion check."""
+
+    if layout == "single":
+        expected_paths = [output_dir / "data.lance"]
+        discovered_paths = expected_paths if expected_paths[0].exists() else []
+    else:
+        expected_paths = [
+            output_dir / f"part_{start:08d}_{min(start + rows_per_part, expected_rows):08d}.lance"
+            for start in range(0, expected_rows, rows_per_part)
+        ]
+        discovered_paths = sorted(output_dir.glob("part_*.lance")) if output_dir.exists() else []
+
+    details: List[Dict[str, Any]] = []
+    total_existing_rows = 0
+    schema_matches = True
+    read_errors: List[str] = []
+    for path in discovered_paths:
+        try:
+            existing = lance.dataset(str(path))
+            count = int(existing.count_rows())
+            schema_ok = existing.schema.equals(OUTPUT_SCHEMA, check_metadata=True)
+            total_existing_rows += count
+            schema_matches = schema_matches and schema_ok
+            details.append({"path": str(path), "rows": count, "schema_matches": schema_ok})
+        except Exception as exc:
+            schema_matches = False
+            read_errors.append(f"{path}: {type(exc).__name__}: {exc}")
+
+    expected_set = {str(path) for path in expected_paths}
+    discovered_set = {str(path) for path in discovered_paths}
+    paths_match = expected_set == discovered_set
+    complete = (
+        expected_rows > 0
+        and paths_match
+        and schema_matches
+        and not read_errors
+        and total_existing_rows == expected_rows
+    )
+    return {
+        "complete": complete,
+        "expected_rows": int(expected_rows),
+        "existing_rows": int(total_existing_rows),
+        "paths_match": paths_match,
+        "schema_matches": schema_matches,
+        "expected_paths": sorted(expected_set),
+        "discovered_paths": sorted(discovered_set),
+        "details": details,
+        "read_errors": read_errors,
+    }
+
+
 def channel_preflight_columns(schema: pa.Schema) -> List[str]:
     required = {"recording_id", "channel_count", "channel_mask"}
     missing = required - set(schema.names)
@@ -855,6 +987,51 @@ def run(args: argparse.Namespace) -> None:
     for spec in specs:
         try:
             dataset = lance.dataset(spec.lance_path)
+            source_rows = int(dataset.count_rows())
+            source_row_limit = (
+                min(source_rows, args.limit) if args.limit is not None else source_rows
+            )
+            # Fast path for outputs produced before row skipping existed.  A
+            # complete historical output has one processed row per requested
+            # source row, so it can be reused without rescanning channel
+            # metadata or materializing EEG.  Outputs with skipped rows do not
+            # satisfy this fast path and are checked strictly after selection.
+            if args.skip_existing_complete:
+                dataset_output_dir = output_root / spec.dataset_key
+                existing_output = inspect_existing_output(
+                    dataset_output_dir,
+                    layout=args.layout,
+                    expected_rows=source_row_limit,
+                    rows_per_part=args.rows_per_part,
+                )
+                if existing_output["complete"]:
+                    summaries.append(
+                        {
+                            "dataset_key": spec.dataset_key,
+                            "input_lance": spec.lance_path,
+                            "catalog_path": spec.catalog_path,
+                            "channel_map_path": spec.channel_map_path,
+                            "source_rows": source_rows,
+                            "requested_rows": source_row_limit,
+                            "trainable_rows": source_row_limit,
+                            "row_selection_scanned": False,
+                            "skipped_too_short_count": 0,
+                            "skipped_too_short_rows": [],
+                            "source_row_provenance_field": "sample_id",
+                            "existing_output_check": existing_output,
+                            "completion_check_mode": "source-row-count fast path",
+                            "status": "SKIPPED_EXISTING_COMPLETE",
+                            "processed_rows": source_row_limit,
+                            "rows_processed_this_run": 0,
+                            "output_paths": existing_output["expected_paths"],
+                        }
+                    )
+                    print(
+                        f"SKIP dataset={spec.dataset_key}: existing output is complete "
+                        f"({source_row_limit} rows, schema match; fast path)",
+                        flush=True,
+                    )
+                    continue
             resolver = CatalogResolver(dataset.schema, spec.catalog_path)
             overrides = load_channel_override(spec.channel_map_path)
             input_columns(dataset.schema)
@@ -897,7 +1074,13 @@ def run(args: argparse.Namespace) -> None:
 
     for spec, dataset, resolver, overrides, preflight in opened:
         source_rows = dataset.count_rows()
-        total_rows = min(source_rows, args.limit) if args.limit is not None else source_rows
+        source_row_limit = min(source_rows, args.limit) if args.limit is not None else source_rows
+        selection = select_trainable_rows(
+            dataset,
+            source_row_limit=source_row_limit,
+            batch_size=args.read_batch_size,
+        )
+        total_rows = len(selection.eligible_source_indices)
         mapped_standard = sorted(set(preflight.source_to_standard.values()))
         base_summary: Dict[str, Any] = {
             "dataset_key": spec.dataset_key,
@@ -905,7 +1088,12 @@ def run(args: argparse.Namespace) -> None:
             "catalog_path": spec.catalog_path,
             "channel_map_path": spec.channel_map_path,
             "source_rows": source_rows,
-            "requested_rows": total_rows,
+            "requested_rows": source_row_limit,
+            "trainable_rows": total_rows,
+            "row_selection_scanned": True,
+            "skipped_too_short_count": len(selection.skipped_too_short_rows),
+            "skipped_too_short_rows": selection.skipped_too_short_rows,
+            "source_row_provenance_field": "sample_id",
             "channel_preflight": _preflight_summary(preflight),
             "mapped_standard_channels": mapped_standard,
             "missing_standard_channels": [
@@ -928,7 +1116,48 @@ def run(args: argparse.Namespace) -> None:
             )
             continue
 
+        if total_rows == 0:
+            base_summary.update(
+                {
+                    "status": "SKIPPED_NO_TRAINABLE_ROWS",
+                    "processed_rows": 0,
+                    "rows_processed_this_run": 0,
+                    "output_paths": [],
+                }
+            )
+            summaries.append(base_summary)
+            print(
+                f"SKIP dataset={spec.dataset_key}: all {source_row_limit} requested rows "
+                "produce zero samples at 100 Hz",
+                flush=True,
+            )
+            continue
+
         dataset_output_dir = output_root / spec.dataset_key
+        existing_output = inspect_existing_output(
+            dataset_output_dir,
+            layout=args.layout,
+            expected_rows=total_rows,
+            rows_per_part=args.rows_per_part,
+        )
+        base_summary["existing_output_check"] = existing_output
+        if args.skip_existing_complete and existing_output["complete"]:
+            base_summary.update(
+                {
+                    "status": "SKIPPED_EXISTING_COMPLETE",
+                    "processed_rows": total_rows,
+                    "rows_processed_this_run": 0,
+                    "output_paths": existing_output["expected_paths"],
+                }
+            )
+            summaries.append(base_summary)
+            print(
+                f"SKIP dataset={spec.dataset_key}: existing output is complete "
+                f"({total_rows} rows, schema match)",
+                flush=True,
+            )
+            continue
+
         if args.layout == "single":
             writer: Any = SingleLanceWriter(
                 str(dataset_output_dir), total_rows, args.overwrite, args.dry_run
@@ -944,31 +1173,38 @@ def run(args: argparse.Namespace) -> None:
 
         stats = ConversionStats()
         local_idx = 0
+        source_row_idx = 0
+        eligible_source_indices = set(selection.eligible_source_indices)
         columns = input_columns(dataset.schema)
         scanner = dataset.scanner(columns=columns, batch_size=args.read_batch_size)
         for record_batch in scanner.to_batches():
-            if local_idx >= total_rows:
+            if source_row_idx >= source_row_limit:
                 break
             raw_rows = record_batch.to_pylist()
-            remaining = total_rows - local_idx
-            if len(raw_rows) > remaining:
-                raw_rows = raw_rows[:remaining]
-            converted = [
-                convert_row(
-                    row,
-                    dataset_key=spec.dataset_key,
-                    global_idx=local_idx + offset,
-                    resolver=resolver,
-                    overrides=overrides,
-                    stats=stats,
-                    allow_unmapped_channels=True,
-                )
-                for offset, row in enumerate(raw_rows)
-            ]
-            writer.write(converted, first_global_idx=local_idx)
-            local_idx += len(converted)
+            converted: List[Dict[str, Any]] = []
+            for row in raw_rows:
+                if source_row_idx >= source_row_limit:
+                    break
+                if source_row_idx in eligible_source_indices:
+                    converted.append(
+                        convert_row(
+                            row,
+                            dataset_key=spec.dataset_key,
+                            global_idx=local_idx + len(converted),
+                            resolver=resolver,
+                            overrides=overrides,
+                            stats=stats,
+                            allow_unmapped_channels=True,
+                            source_row_idx=source_row_idx,
+                        )
+                    )
+                source_row_idx += 1
+            if converted:
+                writer.write(converted, first_global_idx=local_idx)
+                local_idx += len(converted)
             print(
-                f"dataset={spec.dataset_key} converted={local_idx}/{total_rows}",
+                f"dataset={spec.dataset_key} converted={local_idx}/{total_rows} "
+                f"source_scanned={source_row_idx}/{source_row_limit}",
                 flush=True,
             )
 
@@ -982,6 +1218,7 @@ def run(args: argparse.Namespace) -> None:
             {
                 "status": "DRY_RUN_PASSED" if args.dry_run else "CONVERTED",
                 "processed_rows": stats.rows,
+                "rows_processed_this_run": stats.rows,
                 "tail_rows": stats.tail_rows,
                 "input_valid_samples": _counter_dict(stats.input_valid_samples),
                 "output_valid_samples": _counter_dict(stats.output_valid_samples),
@@ -1063,6 +1300,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--read-batch-size", type=int, default=128)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--dry-run", action="store_true", help="process and validate without writing Lance")
+    parser.add_argument(
+        "--skip-existing-complete",
+        action="store_true",
+        help=(
+            "skip a dataset only when its existing output has the expected dense row count, "
+            "exact OUTPUT_SCHEMA, and complete expected path set"
+        ),
+    )
     parser.add_argument(
         "--overwrite",
         action="store_true",

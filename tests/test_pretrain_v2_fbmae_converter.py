@@ -261,3 +261,101 @@ def test_missing_catalog_skips_dataset_and_continues_other_inputs(tmp_path):
         "missing": "SKIPPED_CATALOG_UNAVAILABLE",
         "good": "CONVERTED",
     }
+
+
+def test_too_short_row_is_skipped_and_source_index_is_preserved(tmp_path):
+    full_t = np.arange(2000, dtype=np.float32) / 200.0
+    rows = []
+    for source_row_idx, valid_samples in enumerate((2000, 1, 2000)):
+        signal = (
+            np.sin(2 * np.pi * 10 * full_t)
+            if valid_samples == 2000
+            else np.asarray([0.25], dtype=np.float32)
+        )
+        rows.append(
+            {
+                "recording_id": f"sub-{source_row_idx + 1:02d}/eeg/test.edf",
+                "start_seconds": float(source_row_idx * 10),
+                "valid_samples": valid_samples,
+                "sample_rate_hz": 200,
+                "channel_count": 1,
+                "channel_names": ["Cz"],
+                "channel_mask": [True],
+                "eeg": signal[None, :].tolist(),
+            }
+        )
+
+    source = tmp_path / "source_with_tiny_tail.lance"
+    output = tmp_path / "processed"
+    lance.write_dataset(pa.Table.from_pylist(rows), str(source), mode="create")
+    run(
+        parse_args(
+            [
+                "--input",
+                f"synthetic={source}",
+                "--output-root",
+                str(output),
+            ]
+        )
+    )
+
+    actual = lance.dataset(str(output / "synthetic" / "data.lance"))
+    assert actual.count_rows() == 2
+    ids = actual.to_table(columns=["global_idx", "sample_id"]).to_pylist()
+    assert ids == [
+        {"global_idx": 0, "sample_id": 0},
+        {"global_idx": 1, "sample_id": 2},
+    ]
+    summary = json.loads((output / "conversion_summary.json").read_text("utf-8"))
+    item = summary["datasets"][0]
+    assert item["trainable_rows"] == 2
+    assert item["skipped_too_short_count"] == 1
+    assert item["source_row_provenance_field"] == "sample_id"
+    assert item["skipped_too_short_rows"] == [
+        {
+            "source_row_idx": 1,
+            "recording_id": "sub-02/eeg/test.edf",
+            "valid_samples": 1,
+            "sample_rate_hz": 200.0,
+            "valid_samples_at_100hz": 0,
+        }
+    ]
+
+
+def test_skip_existing_complete_and_rewrite_incomplete_output(tmp_path):
+    t = np.arange(2000, dtype=np.float32) / 200.0
+    rows = [
+        {
+            "recording_id": f"sub-{index + 1:02d}/eeg/test.edf",
+            "start_seconds": 0.0,
+            "valid_samples": 2000,
+            "sample_rate_hz": 200,
+            "channel_count": 1,
+            "channel_names": ["Cz"],
+            "channel_mask": [True],
+            "eeg": np.sin(2 * np.pi * (8 + index) * t)[None, :].tolist(),
+        }
+        for index in range(2)
+    ]
+    source = tmp_path / "source.lance"
+    output = tmp_path / "processed"
+    lance.write_dataset(pa.Table.from_pylist(rows), str(source), mode="create")
+
+    base = ["--input", f"synthetic={source}", "--output-root", str(output)]
+    run(parse_args([*base, "--limit", "1"]))
+    assert lance.dataset(str(output / "synthetic" / "data.lance")).count_rows() == 1
+
+    # One existing row is incomplete for the two-row run, so it must be
+    # overwritten rather than skipped.
+    run(parse_args([*base, "--overwrite", "--skip-existing-complete"]))
+    assert lance.dataset(str(output / "synthetic" / "data.lance")).count_rows() == 2
+    summary = json.loads((output / "conversion_summary.json").read_text("utf-8"))
+    assert summary["datasets"][0]["status"] == "CONVERTED"
+
+    # The now-complete output is reused without opening a writer.
+    run(parse_args([*base, "--overwrite", "--skip-existing-complete"]))
+    summary = json.loads((output / "conversion_summary.json").read_text("utf-8"))
+    item = summary["datasets"][0]
+    assert item["status"] == "SKIPPED_EXISTING_COMPLETE"
+    assert item["processed_rows"] == 2
+    assert item["rows_processed_this_run"] == 0
