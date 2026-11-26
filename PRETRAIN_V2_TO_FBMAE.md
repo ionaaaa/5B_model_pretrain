@@ -97,6 +97,21 @@ Use repeated `--dataset DATASET_KEY` to select a subset from the manifest. The
 existing repeated `--input DATASET_KEY=PATH` CLI remains available for ad-hoc
 runs.
 
+The published paths explicitly present in `docs/STATE.md` are materialized as:
+
+```text
+pretrain_v2_published_all.json       63 datasets / 810,599 expected rows
+pretrain_v2_published_shard_01.json  20 datasets / 269,443 expected rows
+pretrain_v2_published_shard_02.json  21 datasets / 269,405 expected rows
+pretrain_v2_published_shard_03.json  22 datasets / 271,751 expected rows
+```
+
+The three shards are disjoint and their union is exactly the all-manifest.
+They are balanced by expected row count, not merely dataset count. `STATE.md`
+claims 96 published datasets in its heading, but this checkout contains only
+63 unique explicit `pretrain_V2` / `pretrain_V2_partial` Lance paths and the
+linked 205-row CSV is absent; no path was invented for the missing entries.
+
 ## Tencent Cloud dry run
 
 ```bash
@@ -134,7 +149,7 @@ This produces separate outputs:
 ```text
 /mnt/cfs/jianyu/fbmae_processed_by_dataset/ds002722/data.lance
 /mnt/cfs/jianyu/fbmae_processed_by_dataset/ds002723/data.lance
-/mnt/cfs/jianyu/fbmae_processed_by_dataset/conversion_summary.json
+/mnt/cfs/jianyu/fbmae_processed_by_dataset/conversion_summary_pretrain_v2_datasets.example.json
 ```
 
 The summary records admission status, source/processed row counts, tail-window
@@ -143,6 +158,13 @@ sources, valid-channel-count distributions, output paths and processing time.
 
 To retain historical `part_*.lance` layout while still keeping datasets in
 separate subdirectories, add `--layout parts --rows-per-part 10000`.
+
+When `--manifest` is used, the summary filename includes the manifest stem.
+This lets disjoint manifests write different dataset subdirectories under the
+same CFS output root without racing on one summary file. Parallel jobs must not
+contain the same `dataset_key`, must not use `--overwrite`, and must not write
+through a COS FUSE mount that lacks Lance's atomic-commit filesystem semantics.
+Use `--summary-name NAME.json` to override the generated name.
 
 Do not add `--overwrite` for the first production run. If it is explicitly used,
 only the exact generated part paths are overwritten; unrelated files in the

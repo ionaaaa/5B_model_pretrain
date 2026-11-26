@@ -146,6 +146,8 @@ def test_manifest_writes_datasets_separately_and_indices_restart(tmp_path):
         dataset = lance.dataset(str(output / key / "data.lance"))
         values = dataset.to_table(columns=["global_idx", "sample_id", "dataset_key"]).to_pylist()
         assert values == [{"global_idx": 0, "sample_id": 0, "dataset_key": key}]
+    assert (output / "conversion_summary_datasets.json").exists()
+    assert not (output / "conversion_summary.json").exists()
 
 
 def test_subset_match_keeps_dataset_and_records_dropped_channel(tmp_path):

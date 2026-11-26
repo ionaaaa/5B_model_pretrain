@@ -1,0 +1,156 @@
+{
+  "manifest_name": "pretrain_v2_published_shard_02",
+  "source": "docs/STATE.md",
+  "shard_index": 2,
+  "shard_count": 3,
+  "expected_total_rows": 269405,
+  "datasets": [
+    {
+      "dataset_key": "ds002722",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds002722/releases/pretrain_V2/v022/data.lance",
+      "enabled": true,
+      "expected_rows": 8281,
+      "source_status": "PUBLISHED"
+    },
+    {
+      "dataset_key": "ds003004",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds003004/releases/pretrain_V2_partial/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 15250,
+      "source_status": "PUBLISHED_PARTIAL"
+    },
+    {
+      "dataset_key": "ds003655",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds003655/releases/pretrain_V2/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 47200,
+      "source_status": "PUBLISHED"
+    },
+    {
+      "dataset_key": "ds004015",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds004015/releases/pretrain_V2/r002/data.lance",
+      "enabled": true,
+      "expected_rows": 17040,
+      "source_status": "PUBLISHED"
+    },
+    {
+      "dataset_key": "ds004105",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds004105/releases/pretrain_V2/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 9441,
+      "source_status": "PUBLISHED"
+    },
+    {
+      "dataset_key": "ds004284",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds004284/releases/pretrain_V2/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 3413,
+      "source_status": "PUBLISHED"
+    },
+    {
+      "dataset_key": "ds004357",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds004357/releases/pretrain_V2/v007/data.lance",
+      "enabled": true,
+      "expected_rows": 4077,
+      "source_status": "PUBLISHED_LEGACY"
+    },
+    {
+      "dataset_key": "ds004572",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds004572/releases/pretrain_V2/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 19428,
+      "source_status": "PUBLISHED"
+    },
+    {
+      "dataset_key": "ds004579",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds004579/releases/pretrain_V2_partial/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 19257,
+      "source_status": "PUBLISHED_PARTIAL"
+    },
+    {
+      "dataset_key": "ds004580",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds004580/releases/pretrain_V2_partial/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 13096,
+      "source_status": "PUBLISHED_PARTIAL"
+    },
+    {
+      "dataset_key": "ds004603",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds004603/releases/pretrain_V2/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 11050,
+      "source_status": "PUBLISHED"
+    },
+    {
+      "dataset_key": "ds004660",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds004660/releases/pretrain_V2/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 8585,
+      "source_status": "PUBLISHED"
+    },
+    {
+      "dataset_key": "ds005121",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds005121/releases/pretrain_V2/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 14605,
+      "source_status": "PUBLISHED"
+    },
+    {
+      "dataset_key": "ds005594",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds005594/releases/pretrain_V2/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 4438,
+      "source_status": "PUBLISHED"
+    },
+    {
+      "dataset_key": "ds006437",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds006437/releases/pretrain_V2/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 6084,
+      "source_status": "PUBLISHED"
+    },
+    {
+      "dataset_key": "ds007648",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds007648/releases/pretrain_V2_partial/v023/data.lance",
+      "enabled": true,
+      "expected_rows": 5598,
+      "source_status": "PUBLISHED_PARTIAL"
+    },
+    {
+      "dataset_key": "ds007720",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds007720/releases/pretrain_V2/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 11604,
+      "source_status": "PUBLISHED"
+    },
+    {
+      "dataset_key": "ds007865",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds007865/releases/pretrain_V2/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 3691,
+      "source_status": "PUBLISHED"
+    },
+    {
+      "dataset_key": "ds007968",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/ds007968/releases/pretrain_V2/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 4744,
+      "source_status": "PUBLISHED"
+    },
+    {
+      "dataset_key": "emd-eeg-moments",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/emd-eeg-moments/releases/pretrain_V2_partial/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 35366,
+      "source_status": "PUBLISHED_PARTIAL"
+    },
+    {
+      "dataset_key": "le-petit-prince-multi-talker",
+      "lance_path": "${COS_MOUNT_ROOT}/datasets/le-petit-prince-multi-talker/releases/pretrain_V2_partial/r001/data.lance",
+      "enabled": true,
+      "expected_rows": 7157,
+      "source_status": "PUBLISHED_PARTIAL"
+    }
+  ]
+}

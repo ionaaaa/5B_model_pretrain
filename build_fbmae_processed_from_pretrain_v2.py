@@ -822,13 +822,26 @@ def _preflight_summary(preflight: ChannelPreflight) -> Dict[str, Any]:
     }
 
 
+def summary_filename(args: argparse.Namespace) -> str:
+    if args.summary_name:
+        raw = args.summary_name
+    elif args.manifest:
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(args.manifest).stem)
+        raw = f"conversion_summary_{stem}.json"
+    else:
+        raw = "conversion_summary.json"
+    if Path(raw).name != raw or not raw.lower().endswith(".json"):
+        raise ValueError("--summary-name must be a JSON filename without directory components")
+    return raw
+
+
 def run(args: argparse.Namespace) -> None:
     specs = build_input_specs(args)
     if not specs:
         raise ValueError("provide at least one --input or a --manifest")
 
     output_root = Path(args.output_root)
-    summary_path = output_root / "conversion_summary.json"
+    summary_path = output_root / summary_filename(args)
     if not args.dry_run and summary_path.exists() and not args.overwrite:
         raise FileExistsError(
             f"summary already exists: {summary_path}; use a new --output-root"
@@ -1015,6 +1028,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=("single", "parts"),
         default="single",
         help="single writes DATASET/data.lance (default); parts keeps part_*.lance compatibility",
+    )
+    parser.add_argument(
+        "--summary-name",
+        help="summary JSON filename; defaults to a manifest-specific name",
     )
     parser.add_argument("--rows-per-part", type=int, default=10_000)
     parser.add_argument("--read-batch-size", type=int, default=128)
