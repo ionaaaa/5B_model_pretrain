@@ -219,3 +219,45 @@ def test_zero_matching_channels_skips_whole_dataset_before_output(tmp_path):
     item = summary["datasets"][0]
     assert item["status"] == "SKIPPED_CHANNEL_MISMATCH"
     assert item["channel_preflight"]["zero_mapped_rows"] == 1
+
+
+def test_missing_catalog_skips_dataset_and_continues_other_inputs(tmp_path):
+    t = np.arange(2000, dtype=np.float32) / 200.0
+    base = {
+        "recording_id": "sub-01/eeg/test.edf",
+        "start_seconds": 0.0,
+        "valid_samples": 2000,
+        "sample_rate_hz": 200,
+        "channel_count": 1,
+        "channel_mask": [True],
+        "eeg": np.sin(2 * np.pi * 10 * t)[None, :].tolist(),
+    }
+    missing_catalog = tmp_path / "missing_catalog.lance"
+    good = tmp_path / "good.lance"
+    lance.write_dataset(pa.Table.from_pylist([base]), str(missing_catalog), mode="create")
+    lance.write_dataset(
+        pa.Table.from_pylist([{**base, "channel_names": ["Cz"]}]),
+        str(good),
+        mode="create",
+    )
+    output = tmp_path / "continued"
+    run(
+        parse_args(
+            [
+                "--input",
+                f"missing={missing_catalog}",
+                "--input",
+                f"good={good}",
+                "--output-root",
+                str(output),
+            ]
+        )
+    )
+    assert not (output / "missing" / "data.lance").exists()
+    assert lance.dataset(str(output / "good" / "data.lance")).count_rows() == 1
+    report = json.loads((output / "conversion_summary.json").read_text("utf-8"))
+    statuses = {item["dataset_key"]: item["status"] for item in report["datasets"]}
+    assert statuses == {
+        "missing": "SKIPPED_CATALOG_UNAVAILABLE",
+        "good": "CONVERTED",
+    }

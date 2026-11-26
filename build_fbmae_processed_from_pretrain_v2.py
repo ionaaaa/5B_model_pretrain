@@ -853,13 +853,39 @@ def run(args: argparse.Namespace) -> None:
 
     # Audit every row's channel metadata before creating any dataset output.
     for spec in specs:
-        dataset = lance.dataset(spec.lance_path)
-        resolver = CatalogResolver(dataset.schema, spec.catalog_path)
-        overrides = load_channel_override(spec.channel_map_path)
-        input_columns(dataset.schema)
-        preflight = preflight_channel_mapping(
-            dataset, resolver, overrides, batch_size=args.read_batch_size
-        )
+        try:
+            dataset = lance.dataset(spec.lance_path)
+            resolver = CatalogResolver(dataset.schema, spec.catalog_path)
+            overrides = load_channel_override(spec.channel_map_path)
+            input_columns(dataset.schema)
+            preflight = preflight_channel_mapping(
+                dataset, resolver, overrides, batch_size=args.read_batch_size
+            )
+        except Exception as exc:
+            message = str(exc)
+            status = (
+                "SKIPPED_CATALOG_UNAVAILABLE"
+                if "No ordered channel catalog" in message
+                else "SKIPPED_PREFLIGHT_ERROR"
+            )
+            summaries.append(
+                {
+                    "dataset_key": spec.dataset_key,
+                    "input_lance": spec.lance_path,
+                    "catalog_path": spec.catalog_path,
+                    "channel_map_path": spec.channel_map_path,
+                    "status": status,
+                    "processed_rows": 0,
+                    "output_paths": [],
+                    "error_type": type(exc).__name__,
+                    "error": message,
+                }
+            )
+            print(
+                f"SKIP dataset={spec.dataset_key} status={status} error={message}",
+                flush=True,
+            )
+            continue
         opened.append((spec, dataset, resolver, overrides, preflight))
         print(
             f"channel_preflight dataset={spec.dataset_key} rows={dataset.count_rows()} "

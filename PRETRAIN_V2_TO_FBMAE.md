@@ -58,6 +58,11 @@ standard slots remain zero/invalid. A dataset is marked
 channels, or if multiple active source channels ambiguously map to the same
 standard slot. No partial output is written for a rejected dataset.
 
+If a published Lance does not contain an ordered channel catalog in its rows or
+schema and no authoritative `catalog_path` is supplied, that dataset is recorded
+as `SKIPPED_CATALOG_UNAVAILABLE`; the remaining datasets in the manifest keep
+running. The converter never guesses channel order from channel count.
+
 The `ds002718` mapping file format is:
 
 ```json
