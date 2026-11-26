@@ -117,7 +117,7 @@ def test_end_to_end_writer_reproduces_reference_physical_schema(tmp_path):
     ]
     summary = json.loads((output / "conversion_summary.json").read_text("utf-8"))
     assert summary["datasets"][0]["status"] == "CONVERTED"
-    assert summary["strict_channel_matching"] is True
+    assert summary["strict_channel_matching"] is False
 
 
 def test_manifest_writes_datasets_separately_and_indices_restart(tmp_path):
@@ -148,7 +148,7 @@ def test_manifest_writes_datasets_separately_and_indices_restart(tmp_path):
         assert values == [{"global_idx": 0, "sample_id": 0, "dataset_key": key}]
 
 
-def test_unmapped_active_channel_skips_whole_dataset_before_output(tmp_path):
+def test_subset_match_keeps_dataset_and_records_dropped_channel(tmp_path):
     t = np.arange(2000, dtype=np.float32) / 200.0
     row = {
         "recording_id": "sub-01/eeg/test.edf",
@@ -175,8 +175,45 @@ def test_unmapped_active_channel_skips_whole_dataset_before_output(tmp_path):
             ]
         )
     )
-    assert not (output / "bad" / "data.lance").exists()
+    actual = lance.dataset(str(output / "bad" / "data.lance"))
+    row_out = actual.to_table(
+        columns=["valid_channel_count", "channel_valid_mask"]
+    ).to_pylist()[0]
+    assert row_out["valid_channel_count"] == 1
+    summary = json.loads((output / "conversion_summary.json").read_text("utf-8"))
+    item = summary["datasets"][0]
+    assert item["status"] == "CONVERTED"
+    assert "NOT_A_STANDARD_CHANNEL" in item["channel_preflight"]["unmapped_channels"]
+    assert "NOT_A_STANDARD_CHANNEL" in item["dropped_channels"]
+
+
+def test_zero_matching_channels_skips_whole_dataset_before_output(tmp_path):
+    t = np.arange(2000, dtype=np.float32) / 200.0
+    row = {
+        "recording_id": "sub-01/eeg/test.edf",
+        "start_seconds": 0.0,
+        "valid_samples": 2000,
+        "sample_rate_hz": 200,
+        "channel_count": 1,
+        "channel_names": ["NOT_A_STANDARD_CHANNEL"],
+        "channel_mask": [True],
+        "eeg": np.sin(2 * np.pi * 10 * t)[None, :].tolist(),
+    }
+    source = tmp_path / "all_bad.lance"
+    output = tmp_path / "all_rejected"
+    lance.write_dataset(pa.Table.from_pylist([row]), str(source), mode="create")
+    run(
+        parse_args(
+            [
+                "--input",
+                f"all_bad={source}",
+                "--output-root",
+                str(output),
+            ]
+        )
+    )
+    assert not (output / "all_bad" / "data.lance").exists()
     summary = json.loads((output / "conversion_summary.json").read_text("utf-8"))
     item = summary["datasets"][0]
     assert item["status"] == "SKIPPED_CHANNEL_MISMATCH"
-    assert "NOT_A_STANDARD_CHANNEL" in item["channel_preflight"]["unmapped_channels"]
+    assert item["channel_preflight"]["zero_mapped_rows"] == 1

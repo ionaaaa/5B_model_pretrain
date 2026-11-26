@@ -132,8 +132,7 @@ class ChannelPreflight:
     @property
     def eligible(self) -> bool:
         return (
-            not self.unmapped_channels
-            and not self.duplicate_destinations
+            not self.duplicate_destinations
             and self.zero_mapped_rows == 0
         )
 
@@ -409,7 +408,7 @@ def convert_row(
     resolver: CatalogResolver,
     overrides: Mapping[str, str],
     stats: ConversionStats,
-    strict_channels: bool = True,
+    allow_unmapped_channels: bool = True,
 ) -> Dict[str, Any]:
     started = time.perf_counter()
     raw_eeg = row.get("eeg")
@@ -440,9 +439,9 @@ def convert_row(
     aligned, channel_valid_mask, dropped, duplicates = align_to_standard_channels(
         eeg, source_names, source_mask, overrides
     )
-    if strict_channels and (dropped or duplicates):
+    if duplicates or (dropped and not allow_unmapped_channels):
         raise ValueError(
-            "strict channel matching failed: "
+            "channel mapping policy failed: "
             f"unmapped={sorted(set(dropped))}, "
             f"duplicate_destinations={sorted(set(duplicates))}"
         )
@@ -811,6 +810,7 @@ def _counter_dict(counter: Counter) -> Dict[str, int]:
 def _preflight_summary(preflight: ChannelPreflight) -> Dict[str, Any]:
     return {
         "eligible": preflight.eligible,
+        "unmapped_channels_are_dropped": True,
         "rows_scanned": preflight.rows_scanned,
         "catalog_sources": _counter_dict(preflight.catalog_sources),
         "unique_channel_catalogs": len(preflight.catalog_signatures),
@@ -851,7 +851,7 @@ def run(args: argparse.Namespace) -> None:
         print(
             f"channel_preflight dataset={spec.dataset_key} rows={dataset.count_rows()} "
             f"eligible={preflight.eligible} "
-            f"unmapped={sorted(preflight.unmapped_channels)} "
+            f"dropped_unmapped={sorted(preflight.unmapped_channels)} "
             f"duplicates={sorted(preflight.duplicate_destinations)}",
             flush=True,
         )
@@ -883,7 +883,8 @@ def run(args: argparse.Namespace) -> None:
             )
             summaries.append(base_summary)
             print(
-                f"SKIP dataset={spec.dataset_key}: strict channel-template match failed",
+                f"SKIP dataset={spec.dataset_key}: no usable mapping in one or more rows "
+                f"or duplicate destination mapping",
                 flush=True,
             )
             continue
@@ -921,7 +922,7 @@ def run(args: argparse.Namespace) -> None:
                     resolver=resolver,
                     overrides=overrides,
                     stats=stats,
-                    strict_channels=True,
+                    allow_unmapped_channels=True,
                 )
                 for offset, row in enumerate(raw_rows)
             ]
@@ -958,7 +959,8 @@ def run(args: argparse.Namespace) -> None:
         "format": "pretrain_V2_to_FBMAE_summary_v1",
         "dry_run": bool(args.dry_run),
         "layout": args.layout,
-        "strict_channel_matching": True,
+        "channel_policy": "subset-match; >=1 mapped active channel per row; drop unmapped",
+        "strict_channel_matching": False,
         "output_root": str(output_root),
         "datasets": summaries,
     }

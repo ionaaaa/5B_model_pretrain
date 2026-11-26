@@ -50,11 +50,13 @@ samples per 1-second patch.
   authoritative source-to-10–10 mapping is required. The converter deliberately
   fails instead of treating device indices as electrode names.
 
-Channel admission is strict and is checked across every row before an output
-Lance is created. If any active source channel cannot map to the reference
-64-channel vocabulary, or two active source channels map to the same slot, the
-whole dataset is marked `SKIPPED_CHANNEL_MISMATCH` and no partial output is
-written for it.
+Channel admission is checked across every row before an output Lance is
+created. Directly matched source channels are retained; active source channels
+outside the reference vocabulary are explicitly counted and dropped. Missing
+standard slots remain zero/invalid. A dataset is marked
+`SKIPPED_CHANNEL_MISMATCH` only if one or more rows have zero mapped active
+channels, or if multiple active source channels ambiguously map to the same
+standard slot. No partial output is written for a rejected dataset.
 
 The `ds002718` mapping file format is:
 
