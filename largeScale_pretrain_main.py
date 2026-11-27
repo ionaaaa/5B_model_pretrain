@@ -1,5 +1,8 @@
 import argparse
+import hashlib
+import json
 import os
+import time
 from datetime import datetime
 
 import matplotlib.pyplot as plt
@@ -215,6 +218,133 @@ def apply_cli_config(cfg, args):
     if args.output_root is not None:
         cfg.train.output_root = args.output_root
     return cfg
+
+
+def _resolve_processed_lance_inputs(cfg):
+    """Resolve mounted processed Lance paths without initializing NCCL."""
+    part_paths = load_lance_part_paths(cfg.data.lance_part_list_file)
+    if not part_paths:
+        raise ValueError(
+            f"No Lance parts found in {cfg.data.lance_part_list_file!r}."
+        )
+
+    first_part_path = part_paths[0]
+    if not is_remote_lance_path(first_part_path) and not os.path.exists(first_part_path):
+        raise FileNotFoundError(
+            "Lance part does not exist:\n"
+            f"  {first_part_path}\n\n"
+            "Check that every mounted input root is available inside the training container."
+        )
+
+    has_remote_parts = any(is_remote_lance_path(path) for path in part_paths)
+    storage_options = (
+        load_storage_options(cfg.data.storage_options_path)
+        if has_remote_parts
+        else None
+    )
+    return part_paths, storage_options
+
+
+def _run_processed_lance_preflight(cfg):
+    part_paths, storage_options = _resolve_processed_lance_inputs(cfg)
+    shape_params = compute_shape_params(cfg)
+    rows_per_part = int(getattr(cfg.data, "processed_preflight_rows_per_part", 3))
+    return preflight_processed_lance_parts(
+        lance_paths=part_paths,
+        storage_options=storage_options,
+        sample_rows_per_part=rows_per_part,
+        expected_num_tokens=shape_params["num_tokens"],
+        expected_patch_len=shape_params["patch_len"],
+        expected_n_bands=shape_params["n_bands"],
+        expected_frames_per_patch=shape_params["frames_per_patch"],
+        expected_n_channels=cfg.data.n_channels,
+    )
+
+
+def _preflight_coordination_path(cfg):
+    """Return a launch-specific report path on shared storage."""
+    launch_identity = "|".join(
+        [
+            os.environ.get("TORCHELASTIC_RUN_ID", ""),
+            os.environ.get("MASTER_ADDR", ""),
+            os.environ.get("MASTER_PORT", ""),
+            os.path.abspath(cfg.data.lance_part_list_file),
+        ]
+    )
+    digest = hashlib.sha256(launch_identity.encode("utf-8")).hexdigest()[:20]
+    manifest_dir = os.path.dirname(os.path.abspath(cfg.data.lance_part_list_file))
+    coordination_root = os.environ.get(
+        "FBMAE_PREFLIGHT_COORD_DIR",
+        os.path.join(manifest_dir, "runs", ".startup_preflight"),
+    )
+    return os.path.join(coordination_root, f"processed_preflight_{digest}.json")
+
+
+def prepare_processed_preflight_before_distributed(cfg):
+    """Run the long Lance preflight before ProcessGroupNCCL exists.
+
+    With torchrun, rank 0 performs the read-only scan and atomically publishes
+    its report on shared storage. Other ranks poll that file without creating a
+    collective. This prevents the default NCCL collective watchdog from
+    aborting while hundreds of mounted Lance datasets are opened.
+    """
+    if getattr(cfg.data, "input_mode", "processed_lance") != "processed_lance":
+        return None
+    if not cfg.data.use_multi_lance_parts:
+        return None
+
+    launched_distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    if not launched_distributed:
+        print(
+            "[ProcessedPreflight] running before model construction "
+            "(single process)",
+            flush=True,
+        )
+        return _run_processed_lance_preflight(cfg)
+
+    env_rank = int(os.environ["RANK"])
+    report_path = _preflight_coordination_path(cfg)
+    timeout_seconds = int(
+        getattr(cfg.data, "processed_preflight_wait_timeout_seconds", 7200)
+    )
+
+    if env_rank == 0:
+        print(
+            "[ProcessedPreflight] running before NCCL initialization; "
+            f"report={report_path}",
+            flush=True,
+        )
+        try:
+            payload = {"report": _run_processed_lance_preflight(cfg)}
+        except Exception as exc:
+            payload = {"error": f"{type(exc).__name__}: {exc}"}
+
+        report_dir = os.path.dirname(report_path)
+        os.makedirs(report_dir, exist_ok=True)
+        temporary_path = f"{report_path}.rank0-{os.getpid()}.tmp"
+        with open(temporary_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, report_path)
+    else:
+        started = time.monotonic()
+        while not os.path.exists(report_path):
+            if time.monotonic() - started >= timeout_seconds:
+                raise TimeoutError(
+                    "Timed out waiting for rank-0 processed Lance preflight: "
+                    f"path={report_path}, timeout_seconds={timeout_seconds}"
+                )
+            time.sleep(1.0)
+
+    with open(report_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("error"):
+        raise RuntimeError(
+            "Processed Lance startup preflight failed before NCCL initialization: "
+            + payload["error"]
+        )
+    return payload["report"]
 
 
 def setup_distributed(local_rank_arg=None):
@@ -485,7 +615,7 @@ def visualize_train_reconstruction(
         print(f"[Visualization] saved: {save_path}")
 
 
-def build_dataset(cfg, rank):
+def build_dataset(cfg, rank, processed_preflight_report=None):
     input_mode = getattr(cfg.data, "input_mode", "processed_lance")
     if input_mode == "canonical_runtime":
         lance_path = str(cfg.data.canonical_lance_path)
@@ -516,64 +646,21 @@ def build_dataset(cfg, rank):
         raise ValueError(f"Unsupported data input_mode={input_mode!r}")
 
     if cfg.data.use_multi_lance_parts:
-        part_paths = load_lance_part_paths(cfg.data.lance_part_list_file)
-        if len(part_paths) == 0:
-            raise ValueError(
-                f"No Lance parts found in "
-                f"{cfg.data.lance_part_list_file!r}."
-            )
-
+        part_paths, storage_options = _resolve_processed_lance_inputs(cfg)
         first_part_path = part_paths[0]
-        has_remote_parts = any(is_remote_lance_path(path) for path in part_paths)
-        storage_options = (
-            load_storage_options(cfg.data.storage_options_path)
-            if has_remote_parts
-            else None
-        )
 
         rank0_print(rank, "[MultiLance] lance_part_list_file:", cfg.data.lance_part_list_file)
         rank0_print(rank, f"[MultiLance] loaded {len(part_paths)} lance parts")
         rank0_print(rank, "[MultiLance] first part:", first_part_path)
 
-        if not is_remote_lance_path(first_part_path) and not os.path.exists(first_part_path):
-            raise FileNotFoundError(
-                "Lance part does not exist:\n"
-                f"  {first_part_path}\n\n"
-                "Expected mount root:\n"
-                "  /tos/mnt"
-            )
-
-        shape_params = compute_shape_params(cfg)
-        rows_per_part = int(getattr(cfg.data, "processed_preflight_rows_per_part", 3))
-        distributed = dist.is_available() and dist.is_initialized()
-        payload = [None]
-        if (not distributed) or rank == 0:
-            try:
-                payload[0] = {
-                    "report": preflight_processed_lance_parts(
-                        lance_paths=part_paths,
-                        storage_options=storage_options,
-                        sample_rows_per_part=rows_per_part,
-                        expected_num_tokens=shape_params["num_tokens"],
-                        expected_patch_len=shape_params["patch_len"],
-                        expected_n_bands=shape_params["n_bands"],
-                        expected_frames_per_patch=shape_params["frames_per_patch"],
-                        expected_n_channels=cfg.data.n_channels,
-                    )
-                }
-            except Exception as exc:
-                payload[0] = {
-                    "error": f"{type(exc).__name__}: {exc}"
-                }
-        if distributed:
-            dist.broadcast_object_list(payload, src=0)
-        if payload[0].get("error"):
-            raise RuntimeError(
-                "Processed Lance startup preflight failed before model construction: "
-                + payload[0]["error"]
-            )
-
-        preflight = payload[0]["report"]
+        preflight = processed_preflight_report
+        if preflight is None:
+            if dist.is_available() and dist.is_initialized():
+                raise RuntimeError(
+                    "Distributed processed Lance training requires preflight to "
+                    "finish before ProcessGroupNCCL initialization."
+                )
+            preflight = _run_processed_lance_preflight(cfg)
         rank0_print(
             rank,
             "[ProcessedPreflight] PASS "
@@ -582,7 +669,12 @@ def build_dataset(cfg, rank):
             f"elapsed_s={preflight['elapsed_seconds']:.3f}",
         )
         rank0_print(rank, "[ProcessedPreflight] expected_shapes:", preflight["expected_shapes"])
-        for part_report in preflight["part_reports"]:
+        part_reports = preflight["part_reports"]
+        if len(part_reports) <= 12:
+            reports_to_log = part_reports
+        else:
+            reports_to_log = part_reports[:5] + part_reports[-5:]
+        for part_report in reports_to_log:
             rank0_print(
                 rank,
                 "[ProcessedPreflight] "
@@ -590,6 +682,12 @@ def build_dataset(cfg, rank):
                 f"sampled={part_report['sampled_indices']} "
                 f"valid_channels={part_report['valid_channel_counts']} "
                 f"path={part_report['path']}",
+            )
+        if len(reports_to_log) != len(part_reports):
+            rank0_print(
+                rank,
+                "[ProcessedPreflight] "
+                f"omitted_part_reports={len(part_reports) - len(reports_to_log)}",
             )
 
         dataset = MultiLanceEEGPretrainDataset(
@@ -633,12 +731,6 @@ def count_parameters(model):
 
 def main():
     args = parse_args()
-    # ProcessGroupNCCL reads its diagnostics configuration during initialization.
-    # torchrun starts this Python process before that point, so this is early
-    # enough while still preserving explicit launcher-provided values.
-    configure_nccl_flight_recorder_defaults()
-    distributed, rank, world_size, local_rank, device = setup_distributed(args.local_rank)
-
     cfg = apply_cli_config(Config(), args)
     if args.step_debug_last_n is not None:
         if args.step_debug_last_n < 0:
@@ -649,6 +741,18 @@ def main():
         cfg.train.use_prefetch_loader,
     )
     validate_mask_config(cfg.mask)
+
+    # Hundreds of mounted Lance datasets can take longer than NCCL's default
+    # collective timeout to inspect. Complete the rank-0 read-only scan before
+    # ProcessGroupNCCL exists; peer ranks coordinate through a shared JSON
+    # report instead of waiting inside a collective.
+    processed_preflight_report = prepare_processed_preflight_before_distributed(cfg)
+
+    # ProcessGroupNCCL reads its diagnostics configuration during initialization.
+    # This remains before initialization and preserves launcher-provided values.
+    configure_nccl_flight_recorder_defaults()
+    distributed, rank, world_size, local_rank, device = setup_distributed(args.local_rank)
+
     run_dir = configure_run_outputs(cfg, rank, distributed)
     set_seed(cfg.train.seed + rank)
     enable_cuda_attention_kernels(rank)
@@ -679,7 +783,11 @@ def main():
         rank0_print(rank, f"{k}: {v}")
 
     rank0_print(rank, "\n===== Loading EEG Samples From Lance =====")
-    dataset = build_dataset(cfg, rank)
+    dataset = build_dataset(
+        cfg,
+        rank,
+        processed_preflight_report=processed_preflight_report,
+    )
 
     rank0_print(rank, "dataset size:", len(dataset))
 

@@ -23,6 +23,7 @@ class DataConfig:
     lance_parts_dir: str = ""
     lance_part_list_file: str = "./part_paths.txt"
     processed_preflight_rows_per_part: int = 3
+    processed_preflight_wait_timeout_seconds: int = 7200
     storage_options_path: str = "./storage_options.json"
 
     convert_v_to_uv: bool = True
