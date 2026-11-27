@@ -253,6 +253,7 @@ def _run_processed_lance_preflight(cfg):
         lance_paths=part_paths,
         storage_options=storage_options,
         sample_rows_per_part=rows_per_part,
+        progress_every_parts=25,
         expected_num_tokens=shape_params["num_tokens"],
         expected_patch_len=shape_params["patch_len"],
         expected_n_bands=shape_params["n_bands"],

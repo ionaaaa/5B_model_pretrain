@@ -690,6 +690,7 @@ def preflight_processed_lance_parts(
     lance_paths,
     storage_options=None,
     sample_rows_per_part=3,
+    progress_every_parts=0,
     expected_num_tokens=640,
     expected_patch_len=100,
     expected_n_bands=5,
@@ -710,6 +711,9 @@ def preflight_processed_lance_parts(
     sample_rows_per_part = int(sample_rows_per_part)
     if sample_rows_per_part <= 0:
         raise ValueError("sample_rows_per_part must be positive")
+    progress_every_parts = int(progress_every_parts)
+    if progress_every_parts < 0:
+        raise ValueError("progress_every_parts must be greater than or equal to 0")
 
     expected = {
         "num_tokens": int(expected_num_tokens),
@@ -876,6 +880,19 @@ def preflight_processed_lance_parts(
             }
         )
         del ds
+
+        checked_parts = part_id + 1
+        if progress_every_parts and (
+            checked_parts % progress_every_parts == 0
+            or checked_parts == len(lance_paths)
+        ):
+            elapsed = time.perf_counter() - started
+            print(
+                "[ProcessedPreflight] "
+                f"checked_parts={checked_parts}/{len(lance_paths)} "
+                f"sampled_rows={sampled_rows} elapsed_s={elapsed:.1f}",
+                flush=True,
+            )
 
     return {
         "parts": len(lance_paths),
