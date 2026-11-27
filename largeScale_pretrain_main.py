@@ -41,6 +41,7 @@ from lance_dataset import (
     is_remote_lance_path,
     load_storage_options,
     load_lance_part_paths,
+    preflight_processed_lance_parts,
 )
 
 
@@ -121,6 +122,18 @@ def parse_args():
         help="Mounted single Lance path used by canonical_runtime mode.",
     )
     parser.add_argument(
+        "--part-list-file",
+        type=str,
+        default=None,
+        help="Text file containing one mounted processed Lance path per line.",
+    )
+    parser.add_argument(
+        "--preflight-rows-per-part",
+        type=int,
+        default=None,
+        help="Rows sampled per processed Lance during startup schema/shape/finite checks.",
+    )
+    parser.add_argument(
         "--max-samples",
         type=int,
         default=None,
@@ -172,6 +185,13 @@ def apply_cli_config(cfg, args):
         cfg.data.canonical_dataset_key = args.dataset_key
     if args.lance_path is not None:
         cfg.data.canonical_lance_path = args.lance_path
+    if args.part_list_file is not None:
+        cfg.data.lance_part_list_file = args.part_list_file
+        cfg.data.use_multi_lance_parts = True
+    if args.preflight_rows_per_part is not None:
+        if args.preflight_rows_per_part <= 0:
+            raise ValueError("--preflight-rows-per-part must be positive")
+        cfg.data.processed_preflight_rows_per_part = args.preflight_rows_per_part
     if args.max_samples is not None:
         if args.max_samples < 2:
             raise ValueError("--max-samples must be at least 2 for train/val split")
@@ -523,9 +543,59 @@ def build_dataset(cfg, rank):
                 "  /tos/mnt"
             )
 
+        shape_params = compute_shape_params(cfg)
+        rows_per_part = int(getattr(cfg.data, "processed_preflight_rows_per_part", 3))
+        distributed = dist.is_available() and dist.is_initialized()
+        payload = [None]
+        if (not distributed) or rank == 0:
+            try:
+                payload[0] = {
+                    "report": preflight_processed_lance_parts(
+                        lance_paths=part_paths,
+                        storage_options=storage_options,
+                        sample_rows_per_part=rows_per_part,
+                        expected_num_tokens=shape_params["num_tokens"],
+                        expected_patch_len=shape_params["patch_len"],
+                        expected_n_bands=shape_params["n_bands"],
+                        expected_frames_per_patch=shape_params["frames_per_patch"],
+                        expected_n_channels=cfg.data.n_channels,
+                    )
+                }
+            except Exception as exc:
+                payload[0] = {
+                    "error": f"{type(exc).__name__}: {exc}"
+                }
+        if distributed:
+            dist.broadcast_object_list(payload, src=0)
+        if payload[0].get("error"):
+            raise RuntimeError(
+                "Processed Lance startup preflight failed before model construction: "
+                + payload[0]["error"]
+            )
+
+        preflight = payload[0]["report"]
+        rank0_print(
+            rank,
+            "[ProcessedPreflight] PASS "
+            f"parts={preflight['parts']} total_rows={preflight['total_rows']} "
+            f"sampled_rows={preflight['sampled_rows']} "
+            f"elapsed_s={preflight['elapsed_seconds']:.3f}",
+        )
+        rank0_print(rank, "[ProcessedPreflight] expected_shapes:", preflight["expected_shapes"])
+        for part_report in preflight["part_reports"]:
+            rank0_print(
+                rank,
+                "[ProcessedPreflight] "
+                f"part={part_report['part_id']} rows={part_report['rows']} "
+                f"sampled={part_report['sampled_indices']} "
+                f"valid_channels={part_report['valid_channel_counts']} "
+                f"path={part_report['path']}",
+            )
+
         dataset = MultiLanceEEGPretrainDataset(
             lance_paths=part_paths,
             storage_options=storage_options,
+            lengths=preflight["lengths"],
         )
         rank0_print(rank, "num_lance_parts:", len(part_paths))
         return dataset

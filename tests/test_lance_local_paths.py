@@ -94,13 +94,27 @@ class TestMountedLancePaths(unittest.TestCase):
         with patch("largeScale_pretrain_main.os.path.exists", return_value=True):
             with patch("largeScale_pretrain_main.load_storage_options") as load_options:
                 with patch(
-                    "largeScale_pretrain_main.MultiLanceEEGPretrainDataset",
-                    return_value=Mock(),
-                ) as multi_dataset:
-                    build_dataset(Config(), rank=1)
+                    "largeScale_pretrain_main.preflight_processed_lance_parts",
+                    return_value={
+                        "parts": 923,
+                        "total_rows": 923,
+                        "sampled_rows": 2769,
+                        "elapsed_seconds": 0.1,
+                        "expected_shapes": {},
+                        "part_reports": [],
+                        "lengths": [1] * 923,
+                    },
+                ) as preflight:
+                    with patch(
+                        "largeScale_pretrain_main.MultiLanceEEGPretrainDataset",
+                        return_value=Mock(),
+                    ) as multi_dataset:
+                        build_dataset(Config(), rank=1)
 
         load_options.assert_not_called()
+        preflight.assert_called_once()
         self.assertIsNone(multi_dataset.call_args.kwargs["storage_options"])
+        self.assertEqual(multi_dataset.call_args.kwargs["lengths"], [1] * 923)
 
     def test_training_entry_builds_runtime_dataset_from_mounted_lance(self):
         from largeScale_pretrain_main import build_dataset

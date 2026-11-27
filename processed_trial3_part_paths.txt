@@ -1,0 +1,3 @@
+/mnt/cfs/jianyu/5B_model_pretrain/data/ds002722/data.lance
+/mnt/cfs/jianyu/5B_model_pretrain/data/ds002723/data.lance
+/mnt/cfs/jianyu/5B_model_pretrain/data/ds002724/data.lance

@@ -35,11 +35,11 @@ class TestDynamicMasking(unittest.TestCase):
         cfg = MaskConfig()
         torch.manual_seed(7)
         samples = [sample_mask_ratio(cfg) for _ in range(1000)]
-        self.assertEqual(set(samples), {0.9})
+        self.assertEqual(set(samples), {0.8})
 
-    def test_default_expected_ratio_is_fixed_at_point_nine(self):
+    def test_default_expected_ratio_is_fixed_at_point_eight(self):
         cfg = MaskConfig()
-        self.assertAlmostEqual(expected_mask_ratio(cfg), 0.9)
+        self.assertAlmostEqual(expected_mask_ratio(cfg), 0.8)
 
     def test_invalid_mask_configs_raise_clear_errors(self):
         with self.assertRaisesRegex(ValueError, "same length"):

@@ -5,10 +5,12 @@ import math
 import os
 import random
 import re
+import time
 from urllib.parse import urlparse
 
 import lance
 import numpy as np
+import pyarrow as pa
 import pyarrow.fs as pafs
 import torch
 from torch.utils.data import Dataset, Sampler
@@ -682,6 +684,221 @@ class MultiLanceEEGPretrainDataset(Dataset):
                 results[out_pos] = item
 
         return results
+
+
+def preflight_processed_lance_parts(
+    lance_paths,
+    storage_options=None,
+    sample_rows_per_part=3,
+    expected_num_tokens=640,
+    expected_patch_len=100,
+    expected_n_bands=5,
+    expected_frames_per_patch=5,
+    expected_n_channels=64,
+):
+    """Read-only startup validation for processed FBMAE Lance inputs.
+
+    Every part has its required physical fields checked.  A small, evenly
+    distributed row sample is then materialized and validated for shape,
+    finiteness, channel-major ordering, index ranges, masks, and zero-valued
+    missing-channel payloads.  The returned row counts can be passed to
+    ``MultiLanceEEGPretrainDataset`` to avoid counting every part twice.
+    """
+
+    if not lance_paths:
+        raise ValueError("processed Lance preflight requires at least one path")
+    sample_rows_per_part = int(sample_rows_per_part)
+    if sample_rows_per_part <= 0:
+        raise ValueError("sample_rows_per_part must be positive")
+
+    expected = {
+        "num_tokens": int(expected_num_tokens),
+        "patch_len": int(expected_patch_len),
+        "n_bands": int(expected_n_bands),
+        "frames_per_patch": int(expected_frames_per_patch),
+        "n_channels": int(expected_n_channels),
+    }
+    if expected["num_tokens"] % expected["n_channels"] != 0:
+        raise ValueError(
+            "expected_num_tokens must be divisible by expected_n_channels"
+        )
+    expected_time_patches = expected["num_tokens"] // expected["n_channels"]
+    expected_channel_indices = torch.arange(
+        expected["n_channels"], dtype=torch.int64
+    ).repeat_interleave(expected_time_patches)
+    expected_time_indices = torch.arange(
+        expected_time_patches, dtype=torch.int64
+    ).repeat(expected["n_channels"])
+    expected_physical_schema = {
+        "num_tokens": pa.int64(),
+        "patch_len": pa.int64(),
+        "n_bands": pa.int64(),
+        "frames_per_patch": pa.int64(),
+        "n_channels": pa.int64(),
+        "token_inputs": pa.list_(pa.float64()),
+        "targets": pa.list_(pa.float64()),
+        "token_channel_indices": pa.list_(pa.int64()),
+        "token_time_indices": pa.list_(pa.int64()),
+        "token_valid_mask": pa.list_(pa.float64()),
+        "channel_valid_mask": pa.list_(pa.float64()),
+    }
+
+    started = time.perf_counter()
+    lengths = []
+    part_reports = []
+    reference_physical_types = None
+    sampled_rows = 0
+
+    for part_id, raw_path in enumerate(lance_paths):
+        path = _normalize_lance_path(raw_path)
+        ds = _open_lance_dataset(path, storage_options=storage_options)
+        row_count = int(ds.count_rows())
+        if row_count <= 0:
+            raise ValueError(f"processed Lance part is empty: {path}")
+
+        missing = [name for name in LanceEEGPretrainDataset.COLUMNS if name not in ds.schema.names]
+        if missing:
+            raise ValueError(
+                f"processed Lance part is missing required columns: path={path}, missing={missing}"
+            )
+        physical_types = {
+            name: str(ds.schema.field(name).type)
+            for name in LanceEEGPretrainDataset.COLUMNS
+        }
+        wrong_physical_types = {
+            name: {
+                "expected": str(expected_physical_schema[name]),
+                "actual": str(ds.schema.field(name).type),
+            }
+            for name in LanceEEGPretrainDataset.COLUMNS
+            if ds.schema.field(name).type != expected_physical_schema[name]
+        }
+        if wrong_physical_types:
+            raise ValueError(
+                f"processed Lance physical schema is incompatible: "
+                f"path={path}, differences={wrong_physical_types}"
+            )
+        if reference_physical_types is None:
+            reference_physical_types = physical_types
+        elif physical_types != reference_physical_types:
+            differences = {
+                name: {
+                    "expected": reference_physical_types[name],
+                    "actual": physical_types[name],
+                }
+                for name in LanceEEGPretrainDataset.COLUMNS
+                if physical_types[name] != reference_physical_types[name]
+            }
+            raise ValueError(
+                f"processed Lance physical schema mismatch: path={path}, differences={differences}"
+            )
+
+        count = min(sample_rows_per_part, row_count)
+        sample_indices = sorted(
+            set(np.linspace(0, row_count - 1, num=count, dtype=np.int64).tolist())
+        )
+        table = ds.take(indices=sample_indices, columns=LanceEEGPretrainDataset.COLUMNS)
+        samples = LanceEEGPretrainDataset._table_to_samples(table)
+
+        valid_channel_counts = []
+        for row_index, sample in zip(sample_indices, samples):
+            prefix = f"path={path}, row={row_index}"
+            actual_shapes = {
+                "token_inputs": tuple(sample["token_inputs"].shape),
+                "targets": tuple(sample["targets"].shape),
+                "token_channel_indices": tuple(sample["token_channel_indices"].shape),
+                "token_time_indices": tuple(sample["token_time_indices"].shape),
+                "token_valid_mask": tuple(sample["token_valid_mask"].shape),
+                "channel_valid_mask": tuple(sample["channel_valid_mask"].shape),
+            }
+            expected_shapes = {
+                "token_inputs": (expected["num_tokens"], expected["patch_len"]),
+                "targets": (
+                    expected["num_tokens"],
+                    expected["n_bands"],
+                    expected["frames_per_patch"],
+                ),
+                "token_channel_indices": (expected["num_tokens"],),
+                "token_time_indices": (expected["num_tokens"],),
+                "token_valid_mask": (expected["num_tokens"],),
+                "channel_valid_mask": (expected["n_channels"],),
+            }
+            if actual_shapes != expected_shapes:
+                raise ValueError(
+                    f"processed Lance shape mismatch: {prefix}, "
+                    f"actual={actual_shapes}, expected={expected_shapes}"
+                )
+
+            for name in ("token_inputs", "targets", "token_valid_mask", "channel_valid_mask"):
+                if not torch.isfinite(sample[name]).all().item():
+                    raise ValueError(f"processed Lance contains NaN/Inf: {prefix}, field={name}")
+
+            channel_indices = sample["token_channel_indices"]
+            time_indices = sample["token_time_indices"]
+            if not torch.equal(channel_indices, expected_channel_indices):
+                raise ValueError(
+                    f"processed Lance token channel ordering is not channel-major: {prefix}"
+                )
+            if not torch.equal(time_indices, expected_time_indices):
+                raise ValueError(
+                    f"processed Lance token time ordering is not channel-major: {prefix}"
+                )
+
+            token_mask = sample["token_valid_mask"]
+            channel_mask = sample["channel_valid_mask"]
+            if not torch.all((token_mask == 0) | (token_mask == 1)).item():
+                raise ValueError(f"token_valid_mask is not binary: {prefix}")
+            if not torch.all((channel_mask == 0) | (channel_mask == 1)).item():
+                raise ValueError(f"channel_valid_mask is not binary: {prefix}")
+            expected_token_mask = channel_mask[channel_indices]
+            if not torch.equal(token_mask, expected_token_mask):
+                raise ValueError(
+                    f"token_valid_mask is misaligned with channel_valid_mask: {prefix}"
+                )
+            invalid_tokens = token_mask == 0
+            if invalid_tokens.any().item():
+                if not torch.all(sample["token_inputs"][invalid_tokens] == 0).item():
+                    raise ValueError(f"invalid-channel token_inputs are not zero: {prefix}")
+                if not torch.all(sample["targets"][invalid_tokens] == 0).item():
+                    raise ValueError(f"invalid-channel targets are not zero: {prefix}")
+
+            valid_channel_counts.append(int(channel_mask.sum().item()))
+            sampled_rows += 1
+
+        lengths.append(row_count)
+        part_reports.append(
+            {
+                "part_id": int(part_id),
+                "path": path,
+                "rows": row_count,
+                "sampled_indices": [int(x) for x in sample_indices],
+                "valid_channel_counts": valid_channel_counts,
+            }
+        )
+        del ds
+
+    return {
+        "parts": len(lance_paths),
+        "total_rows": int(sum(lengths)),
+        "sampled_rows": int(sampled_rows),
+        "rows_per_part_requested": sample_rows_per_part,
+        "lengths": lengths,
+        "expected_shapes": {
+            "token_inputs": [expected["num_tokens"], expected["patch_len"]],
+            "targets": [
+                expected["num_tokens"],
+                expected["n_bands"],
+                expected["frames_per_patch"],
+            ],
+            "token_channel_indices": [expected["num_tokens"]],
+            "token_time_indices": [expected["num_tokens"]],
+            "token_valid_mask": [expected["num_tokens"]],
+            "channel_valid_mask": [expected["n_channels"]],
+        },
+        "physical_types": reference_physical_types,
+        "part_reports": part_reports,
+        "elapsed_seconds": float(time.perf_counter() - started),
+    }
 
 
 class PartAwareDistributedBatchSampler(Sampler):

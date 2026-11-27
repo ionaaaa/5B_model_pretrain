@@ -83,7 +83,7 @@ class PrefetchLoaderCLITests(unittest.TestCase):
         self.assertEqual(cfg.model.d_model, 4096)
         self.assertEqual(cfg.model.n_heads, 16)
         self.assertEqual(cfg.model.depth, 25)
-        self.assertEqual(cfg.mask.mask_ratios, [0.9])
+        self.assertEqual(cfg.mask.mask_ratios, [0.8])
         self.assertEqual(cfg.mask.mask_ratio_weights, [1.0])
         self.assertEqual(cfg.data.input_mode, "canonical_runtime")
         self.assertEqual(cfg.data.canonical_dataset_key, "egobrain")
@@ -97,6 +97,28 @@ class PrefetchLoaderCLITests(unittest.TestCase):
         self.assertEqual(cfg.train.num_epochs, 1)
         self.assertEqual(cfg.train.lr, 0.0002)
         self.assertEqual(cfg.train.output_root, "/mnt/cfs/output/runtime_trial")
+
+    def test_processed_multilance_cli_sets_explicit_list_and_preflight_sample_size(self):
+        part_list = (
+            "/mnt/cfs/jianyu/5B_model_pretrain/"
+            "processed_trial3_part_paths.txt"
+        )
+        argv = [
+            "largeScale_pretrain_main.py",
+            "--model-profile", "50m",
+            "--data-mode", "processed_lance",
+            "--part-list-file", part_list,
+            "--preflight-rows-per-part", "4",
+        ]
+        with patch.object(sys, "argv", argv):
+            cfg = apply_cli_config(Config(), parse_args())
+
+        self.assertEqual(cfg.model.profile, "50m")
+        self.assertEqual(cfg.data.input_mode, "processed_lance")
+        self.assertTrue(cfg.data.use_multi_lance_parts)
+        self.assertEqual(cfg.data.lance_part_list_file, part_list)
+        self.assertEqual(cfg.data.processed_preflight_rows_per_part, 4)
+        self.assertEqual(cfg.mask.mask_ratios, [0.8])
 
 
 if __name__ == "__main__":
